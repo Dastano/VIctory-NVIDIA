@@ -30,6 +30,12 @@ askings, 14.5 ms, 8.1 GB checked of which 8.1 GB unchanged; moves 6.2 ms.
 - ~21,500 refreshes over ~16.9 GB of ranges; ~320 write-watch / guard askings (14-17 ms, all
   threads) over ~8.3 GB of which 99.5 % unchanged; moves ~6 ms.
 
+Note on the "5.2 ms waiting for the submission lock": it is measured from the call of
+`Host::submit` (host.rs:5458) to `STARTED` (host.rs:5535), which includes `card_steps` and
+`settle` / `relay_wait` for flights whose writes the submission reads (host.rs:5476-5494). So it
+is largely waiting for shader writes to land, not contention. `VICTORY_FILL_TITLE=1` targets
+exactly such waits (another fork measured 15-24 ms a frame less): first in the queue.
+
 So 30 fps needs about 7 ms off the submitting thread: the lock wait and the refresh checks are
 the targets, not the card (0.2 ms of waiting) and not shader translation.
 
