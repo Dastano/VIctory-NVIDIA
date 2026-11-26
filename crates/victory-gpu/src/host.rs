@@ -7600,6 +7600,14 @@ fn ahead_of_writes() -> bool {
 /// earlier than its step: the title's bytes are the same until a step writes
 /// title memory, and behind such a step everything is asked for again, as it
 /// was.
+/// How many spans [`Batch::refresh_front`] still looks at on the submitting
+/// thread for "copies nothing" before spreading: `VICTORY_REFRESH_FEW`
+/// (256; more: that look stays here for longer lists).
+fn refresh_few() -> usize {
+    static FEW: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *FEW.get_or_init(|| std::env::var("VICTORY_REFRESH_FEW").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(256))
+}
+
 fn refresh_front() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     ahead_of_writes() && (joins_asked().0 > 1 || *ON.get_or_init(|| crate::switch::on("VICTORY_REFRESH_FRONT")))
@@ -7917,9 +7925,12 @@ impl Batch {
         let before = [0, 2].map(|i| PREPARING[i].load(Ordering::Relaxed));
         // Those known to copy nothing are said so here, unless they are very
         // many: then beside the others.
-        const FEW: usize = 256;
+        // (`VICTORY_REFRESH_FEW`, 256: above it the look goes to the helpers; a
+        // profile of the jail scene had ~260 spans a flush, 87 % of them copying
+        // nothing, all spread and waited for.)
+        let few = refresh_few();
         let mut spans = spans;
-        let many = spans.len() > FEW;
+        let many = spans.len() > few;
         if !many {
             #[cfg(feature = "diagnostics")]
             let all = spans.len();
