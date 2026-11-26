@@ -55,6 +55,12 @@ Release vs diag: preparing 3.4 ms shorter, but the submitting thread then waits 
 r28 profile of the submit lane (release): Host::submit waiting in ntdll (the card) 13 %, the lane idle waiting for the title's work 8.6 %, wide waits 7 %, GetWriteWatch 6 %, NVIDIA driver 6.5 %.
 r29: with two frames allowed in the line the title no longer waits at presents (9.9 -> 0.0 ms a frame), and the fps do not move: the submit lane (36.6 ms of work a frame, ~5 ms of it waiting for shader writes to land before the title reads that memory) sets the frame time by itself. Further gains need that lane's per-frame work cut (the memory sync design), not settings.
 
+| r30 | release + mimalloc, intro played (Enter only until 112 s), no turns | 26.5 / 14.0 | 27.1 (min 25.3) | 24.7 | 8.9 | 10.9 | 2.9 |
+| r31 | r25 with the Windows "High performance" power plan | 25.7 / 16.3 | 25.0 (min 22.9) | 22.6 | 8.2 | 10.0 | 6.2 |
+| r32 | diag + `VICTORY_GPU_TIMING=1` (lists run one by one; fps not comparable) | 10.2 | 10.5 | 25.9 | 12.3 | 19.7 | 48.1 |
+
+Card side: during play nvidia-smi shows the 4090 at 2805 MHz, P0, "100 %" utilization but only ~120 W. The fork's own count ("the card's clock per frame", r22) has something of ours queued on the card 87-90 % of the frame, the submitting thread waiting for it 1-6 ms. Read together: the card is rarely loaded but almost always has a queue waiting on a fence; frame time is a chain of 16 CPU/GPU round trips a frame (submit, run, compare, fetch, land), not the GPU's or one thread's throughput alone. That chain is the next thing to shorten (fewer round trips a frame), which is a change to the relay / flights design.
+
 None of r02-r05 beats r01 beyond run-to-run noise (~1 fps); FILL_TITLE is worse here (the card is waited for 7.9 ms a frame instead of 0.2).
 
 The card waits 0.2-0.5 ms a frame: the frame is bound by the CPU's preparing.
