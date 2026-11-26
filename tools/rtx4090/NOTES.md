@@ -38,6 +38,11 @@ Pipelines warmed with `victory warm` before the runs (r01 on).
 
 From r21 on the runs also turn the camera in the jail scene (right stick, 4 s every 20 s from 280 s), where the fps drop.
 
+| r21 | mimalloc + `VICTORY_REFRESH_FEW=1000000` (look for "copies nothing" before spreading), camera turns | 25.5 / 15.7 | 25.4 (min 23.7) | 28.1 | 11.0 | 10.9 | 1.4 |
+| r22 | mimalloc, camera turns (the base with turns) | 25.3 / 14.9 | 25.0 (min 22.6) | 26.3 | 9.2 | 10.8 | 2.3 |
+| r23 | mimalloc + `VICTORY_TEXTURE_ROOM_PERCENT=96`, `VICTORY_TEXTURE_STAGE_MB=768`, turns | 25.9 / 22.6 | 25.3 (min 23.6) | 27.1 | 9.6 | 11.1 | 1.7 |
+| r24 | mimalloc + `VICTORY_MAP_THREADS=4`, turns | 25.1 / 12.4 | 25.1 (min 24.1) | 29.6 | 10.7 | 11.6 | 0.5 |
+
 None of r02-r05 beats r01 beyond run-to-run noise (~1 fps); FILL_TITLE is worse here (the card is waited for 7.9 ms a frame instead of 0.2).
 
 The card waits 0.2-0.5 ms a frame: the frame is bound by the CPU's preparing.
