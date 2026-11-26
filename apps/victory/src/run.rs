@@ -177,6 +177,10 @@ pub fn run(
     victory_hle::runtime::use_console_timers();
     #[cfg(feature = "diagnostics")]
     diagnostics(&image, &cfg);
+    // The sampling profiler in release builds too (`VICTORY_PROFILE`), with
+    // no frame phases.
+    #[cfg(all(windows, not(feature = "diagnostics")))]
+    victory_loader::profile_on_schedule(|| 0);
     let late = LateDlls {
         host: resolver.host.clone(),
         title_dir: title_dir.to_owned(),
