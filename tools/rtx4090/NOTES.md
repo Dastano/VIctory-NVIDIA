@@ -43,6 +43,12 @@ From r21 on the runs also turn the camera in the jail scene (right stick, 4 s ev
 | r23 | mimalloc + `VICTORY_TEXTURE_ROOM_PERCENT=96`, `VICTORY_TEXTURE_STAGE_MB=768`, turns | 25.9 / 22.6 | 25.3 (min 23.6) | 27.1 | 9.6 | 11.1 | 1.7 |
 | r24 | mimalloc + `VICTORY_MAP_THREADS=4`, turns | 25.1 / 12.4 | 25.1 (min 24.1) | 29.6 | 10.7 | 11.6 | 0.5 |
 
+| r25 | release build (no diagnostics) + mimalloc, skip list and keys enabled in release (branch `local/rtx4090`), turns | 25.6 / 23.0 | 24.8 (min 23.0) | 23.7 | 8.4 | 10.8 | 5.3 |
+| r26 | r25 + `VICTORY_FILL_TITLE=1` | 24.6 / 16.6 | 24.7 (min 22.7) | 26.1 | 11.4 | 10.4 | 8.5 |
+| r27 | r25 + `VICTORY_REFRESH_FEW=1000000` | 25.6 / 16.3 | 25.2 (min 23.0) | 25.7 | 9.7 | 10.7 | 3.3 |
+
+Release vs diag: preparing 3.4 ms shorter, but the submitting thread then waits for the card (5.3 ms, "title memory read" settles 5.1 ms): the frame stays ~39 ms. In r25 the submit lane worked 35.2 ms a frame; title threads waited 9.9 ms a frame at presents for it.
+
 None of r02-r05 beats r01 beyond run-to-run noise (~1 fps); FILL_TITLE is worse here (the card is waited for 7.9 ms a frame instead of 0.2).
 
 The card waits 0.2-0.5 ms a frame: the frame is bound by the CPU's preparing.
