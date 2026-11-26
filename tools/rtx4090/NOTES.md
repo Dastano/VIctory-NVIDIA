@@ -14,6 +14,12 @@ Pipelines warmed with `victory warm` before the runs (r01 on).
 |---|---|---|---|---|---|---|---|
 | r00 | (pipelines made live, book written) | 25.7 / 19.7 | – | 28.3 | 9.9 | 11.1 | 0.5 |
 | r01 | none (warm cache) | 24.6 / 17.6 | 24.7 (min 23.8) | 30.1 | 10.6 | 11.8 | 0.2 |
+| r02 | `VICTORY_FILL_TITLE=1` | 23.1 / 20.5 | 23.4 | 29.5 | 13.8 | 10.5 | 7.9 |
+| r03 | `VICTORY_CARD_WINDOWS_MB=4096` | 23.8 / 12.0 | 24.3 | 32.1 | 10.0 | 11.7 | 0.2 |
+| r04 | `VICTORY_INPLACE=1` | 23.6 / 20.8 | 23.8 | 30.2 | 9.8 | 13.2 | 2.2 |
+| r05 | `VICTORY_LAND_SKIP=1`, `VICTORY_WIDE_SPIN=50` | 24.2 / 14.2 | 24.7 | 30.2 | 9.4 | 12.6 | 0.1 |
+
+None of r02-r05 beats r01 beyond run-to-run noise (~1 fps); FILL_TITLE is worse here (the card is waited for 7.9 ms a frame instead of 0.2).
 
 The card waits 0.2-0.5 ms a frame: the frame is bound by the CPU's preparing.
 
@@ -45,15 +51,6 @@ the targets, not the card (0.2 ms of waiting) and not shader translation.
   floating). r01: that cutscene was skipped by the scripted Enter; the jail scene is clean.
   Open: whether the heads are drawn once pipelines are warm.
 
-### Open runs (not done: the queue was stopped for low system memory; 32 GB RAM, the title
-takes 18-36 GB)
-
-| Run | Switch |
-|---|---|
-| r02 | `VICTORY_FILL_TITLE=1` |
-| r03 | `VICTORY_CARD_WINDOWS_MB=4096` |
-| r04 | `VICTORY_INPLACE=1` |
-| r05 | `VICTORY_LAND_SKIP=1`, `VICTORY_WIDE_SPIN=50` |
 
 ## CUDA probe (`cuda_probe.c`, driver API from nvcuda.dll, no toolkit)
 
