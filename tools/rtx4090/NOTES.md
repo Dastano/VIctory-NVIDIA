@@ -19,6 +19,9 @@ Pipelines warmed with `victory warm` before the runs (r01 on).
 | r04 | `VICTORY_INPLACE=1` | 23.6 / 20.8 | 23.8 | 30.2 | 9.8 | 13.2 | 2.2 |
 | r05 | `VICTORY_LAND_SKIP=1`, `VICTORY_WIDE_SPIN=50` | 24.2 / 14.2 | 24.7 | 30.2 | 9.4 | 12.6 | 0.1 |
 
+| r07 | mimalloc (branch `perf/mimalloc`, PR trustno1-coder/VIctory-NVIDIA#11) | 26.4 / 16.7 | **26.9 (min 26.0)** | 26.9 | 10.0 | 10.7 | 0.7 |
+| r08 | mimalloc + `VICTORY_UNDER_THREADS=12`, `VICTORY_LAND_THREADS=8` | 26.4 / 15.4 | 26.9 (min 25.6) | 27.3 | 10.2 | 10.2 | 0.3 |
+
 None of r02-r05 beats r01 beyond run-to-run noise (~1 fps); FILL_TITLE is worse here (the card is waited for 7.9 ms a frame instead of 0.2).
 
 The card waits 0.2-0.5 ms a frame: the frame is bound by the CPU's preparing.
@@ -44,6 +47,10 @@ exactly such waits (another fork measured 15-24 ms a frame less): first in the q
 
 So 30 fps needs about 7 ms off the submitting thread: the lock wait and the refresh checks are
 the targets, not the card (0.2 ms of waiting) and not shader translation.
+
+### Profile of the submitting thread (r06, VICTORY_PROFILE, 30 s, 14,823 samples)
+
+Inclusive: shadow::wide / refresh_front 24 % (12 % Condvar waits for its helpers), stale_under_flights 14 % (90 % of it merge_under_writes, half of that waiting in land::Pool::each), heap (ntdll under realloc/alloc) 15 %, take_steps 12 %, write-watch askings ~8 %, contended mutexes 5 %; ntdll self 51 %, NVIDIA driver 11 %. The heap share led to mimalloc (r07: -3 ms preparing, +2 fps). More under-/land threads (r08) change nothing.
 
 ### Visual check
 
