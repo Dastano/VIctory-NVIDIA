@@ -49,6 +49,12 @@ From r21 on the runs also turn the camera in the jail scene (right stick, 4 s ev
 
 Release vs diag: preparing 3.4 ms shorter, but the submitting thread then waits for the card (5.3 ms, "title memory read" settles 5.1 ms): the frame stays ~39 ms. In r25 the submit lane worked 35.2 ms a frame; title threads waited 9.9 ms a frame at presents for it.
 
+| r28 | r25 + profile (release build; `VICTORY_PROFILE` enabled in release on `local/rtx4090`) | – | – | | | | |
+| r29 | r25 + `VICTORY_SUBMIT_FRAMES=2`, `VICTORY_SUBMIT_DEPTH=128` | 25.5 / 16.2 | 25.0 (min 23.4) | 23.8 | 8.7 | 10.6 | 5.3 |
+
+r28 profile of the submit lane (release): Host::submit waiting in ntdll (the card) 13 %, the lane idle waiting for the title's work 8.6 %, wide waits 7 %, GetWriteWatch 6 %, NVIDIA driver 6.5 %.
+r29: with two frames allowed in the line the title no longer waits at presents (9.9 -> 0.0 ms a frame), and the fps do not move: the submit lane (36.6 ms of work a frame, ~5 ms of it waiting for shader writes to land before the title reads that memory) sets the frame time by itself. Further gains need that lane's per-frame work cut (the memory sync design), not settings.
+
 None of r02-r05 beats r01 beyond run-to-run noise (~1 fps); FILL_TITLE is worse here (the card is waited for 7.9 ms a frame instead of 0.2).
 
 The card waits 0.2-0.5 ms a frame: the frame is bound by the CPU's preparing.
