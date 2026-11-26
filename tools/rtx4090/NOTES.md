@@ -22,6 +22,15 @@ Pipelines warmed with `victory warm` before the runs (r01 on).
 | r07 | mimalloc (branch `perf/mimalloc`, PR trustno1-coder/VIctory-NVIDIA#11) | 26.4 / 16.7 | **26.9 (min 26.0)** | 26.9 | 10.0 | 10.7 | 0.7 |
 | r08 | mimalloc + `VICTORY_UNDER_THREADS=12`, `VICTORY_LAND_THREADS=8` | 26.4 / 15.4 | 26.9 (min 25.6) | 27.3 | 10.2 | 10.2 | 0.3 |
 
+| r09 | mimalloc + profile | 26.2 / 15.1 | 26.9 (min 26.0) | 26.6 | 9.5 | 10.9 | 0.8 |
+| r10 | mimalloc, process pinned to CCD0 (V-cache, CPUs 0-15) | 26.2 / 13.9 | 26.8 (min 26.2) | 28.5 | 8.9 | 13.9 | 0.9 |
+| r11 | mimalloc, pinned to CCD1 (frequency, CPUs 16-31) | 23.4 / 18.2 | 22.9 (min 18.2) | 31.6 | 9.2 | 16.3 | 2.2 |
+| r12 | mimalloc + `VICTORY_JOIN_PARTS=16`, `VICTORY_JOIN_LISTS=96` | 26.6 / 15.9 | 27.2 (min 26.6) | 26.7 | 9.7 | 10.8 | 1.1 |
+| r13 | mimalloc + `-Quality` (RELAY=1, CARD_STEPS=0, TEXTURE_NO_WAIT=0) | 17.7 / 8.9 | 18.2 (min 17.5) | 26.4 | 14.6 | 7.8 | 27.4 |
+| r14 | mimalloc + `VICTORY_CARD_STEPS=1` | 22.3 / 16.7 | 22.7 (min 21.4) | 27.1 | 12.4 | 9.5 | 13.2 |
+| r15 | mimalloc + refresh_front spans split at 1 MiB (experiment, reverted) | title crashed at 151 s (write to 0 in title code) | – | | | | |
+| r16 | mimalloc + split at 256 KiB (reverted) | 24.1 / 15.2 | 24.7 (min 24.2) | 33.5 | 17.6 | 11.2 | 0.2 |
+
 None of r02-r05 beats r01 beyond run-to-run noise (~1 fps); FILL_TITLE is worse here (the card is waited for 7.9 ms a frame instead of 0.2).
 
 The card waits 0.2-0.5 ms a frame: the frame is bound by the CPU's preparing.
