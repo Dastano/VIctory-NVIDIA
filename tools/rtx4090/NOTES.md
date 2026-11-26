@@ -89,7 +89,7 @@ Inclusive: shadow::wide / refresh_front 24 % (12 % Condvar waits for its helpers
 
 - r00 (pipelines made live): in the diner cutscene the heads were missing (teeth and eyes
   floating). r01: that cutscene was skipped by the scripted Enter; the jail scene is clean.
-  Open: whether the heads are drawn once pipelines are warm.
+  r30 (release + mimalloc, warm pipelines, Enter only until 112 s so the intro plays, a screenshot every 10 s): the diner cutscene shows every face and head whole (shots 124-156). The floating teeth of r00 came from pipelines still being made; with `victory warm` done they do not appear. Control is given at ~187 s (the move / camera prompt): the first in-game scene is the jail cell. r30 there, no turns: 27.1 fps (min 25.3).
 
 
 ## CUDA probe (`cuda_probe.c`, driver API from nvcuda.dll, no toolkit)
