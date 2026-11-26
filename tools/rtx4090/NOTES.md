@@ -31,6 +31,13 @@ Pipelines warmed with `victory warm` before the runs (r01 on).
 | r15 | mimalloc + refresh_front spans split at 1 MiB (experiment, reverted) | title crashed at 151 s (write to 0 in title code) | – | | | | |
 | r16 | mimalloc + split at 256 KiB (reverted) | 24.1 / 15.2 | 24.7 (min 24.2) | 33.5 | 17.6 | 11.2 | 0.2 |
 
+| r17 | mimalloc + `VICTORY_FAST_CORES=3` | 26.6 / 15.1 | 27.2 (min 26.2) | 27.1 | 10.3 | 10.7 | 0.5 |
+| r18 | mimalloc + `VICTORY_TITLE_PRIORITIES=1` | 26.5 / 21.4 | 27.0 (min 25.8) | 26.7 | 9.8 | 10.6 | 1.0 |
+| r19 | mimalloc + `VICTORY_WIDE_SPIN=200` | 25.9 / 4.9 | 25.9 (min 4.9) | 27.5 | 9.9 | 11.1 | 0.5 |
+| r20 | mimalloc + `VICTORY_LATE_WAIT_LISTS=1024` | 23.2 / 0.8 | 25.2 (min 18.9) | 28.6 | 9.6 | 12.7 | 1.5 |
+
+From r21 on the runs also turn the camera in the jail scene (right stick, 4 s every 20 s from 280 s), where the fps drop.
+
 None of r02-r05 beats r01 beyond run-to-run noise (~1 fps); FILL_TITLE is worse here (the card is waited for 7.9 ms a frame instead of 0.2).
 
 The card waits 0.2-0.5 ms a frame: the frame is bound by the CPU's preparing.
