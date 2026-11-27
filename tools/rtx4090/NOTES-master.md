@@ -134,3 +134,12 @@ water merge) ran 27 rendered / ~55 shown. r65 (walking route, current build) nev
 raised an exception every ~225 ms (83 mini-dumps) and the title ended; no other run had one. Not resolved.
 Without frame generation (r59: DLAA, walking) the build runs 28.8 fps with no such lock. Recommendation for now:
 DLAA, frame generation off.
+
+## Card-step runs and the water, again (r66-r67; the save is now at the first boat ride)
+
+r66 (DLAA, no FG, walking keys; `VICTORY_HEAVY_CARD_RUNS`: constant-buffer reads that follow one another in
+the ring copied in one `CopyBufferRegion`): 29.1 fps mean, 1,036 frames over 40 ms (r59: 28.8, 1,214).
+But its screenshots show small black blocks scattered over the open water around the boat with the water's
+tiled light running (`VICTORY_WAVE64_FIX` on): that light is left out again by default (`VICTORY_WATER_LIGHT=1`
+runs it). r67 (the same, light left out, 7 min, cutscenes on the boat): 29.3 fps over the last 2 min (min
+26.8), no black blocks in the shots; the top-down boat view was not reached in that run.
