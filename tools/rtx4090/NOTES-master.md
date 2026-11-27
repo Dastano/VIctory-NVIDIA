@@ -52,6 +52,8 @@ intro and diner cutscene, the jail cell from ~190 s; camera turns (right stick, 
 | r41 | master + `PORT_CONSTANTS=1` | 26.5 / 25.5 | 14.0 (card waited 8.6 ms) |
 | **r42** | **master + thin LTO** (the build in `target\release`) | **30.0 / 30.0** | 20.1 |
 | r43 | r42 built with `-C target-cpu=native` (Zen 4) | 30.0 / 30.0 (one 12 fps dip earlier) | 20.3 |
+| r44 | r42 again (repeat) | 30.0 / 29.9 | 20.1 |
+| r45 | r42 + `-FrameGen` | 30.0 / 29.6 rendered, **60 shown** (Streamline: 30 presents, 60 frames a second) | 20.4 |
 
 The title caps the frame at 30 fps; r42 has ~13 ms of the 33 ms frame left on the submitting thread.
 
