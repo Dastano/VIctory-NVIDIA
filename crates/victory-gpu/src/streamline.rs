@@ -16,6 +16,8 @@
 //!   upscaling submitted before it, with constants made from it, and sends
 //!   the latency markers Frame Generation needs (Reflex on). Needs the line
 //!   of submissions (`VICTORY_THIN=1` or `VICTORY_ASYNC_SUBMIT=1`).
+//!   `VICTORY_FG_PACING_FIX=0`: the swap chain with two buffers and no
+//!   tearing, as before (default: `VICTORY_FG_BUFFERS`, 3, and tearing).
 //! - `VICTORY_STREAMLINE_DIR`: the folder of `sl.interposer.dll`, its plugins
 //!   and NGX's DLLs (default [`DEFAULT_DIR`]).
 //!
@@ -722,6 +724,30 @@ pub(crate) fn swap_chain_factory(factory: &IDXGIFactory2) -> Option<(IDXGIFactor
     // SAFETY: the proxy's reference, now ours.
     let proxy = unsafe { IDXGIFactory2::from_raw(raw) };
     Some((proxy, queue))
+}
+
+/// `VICTORY_FG_PACING_FIX` (on unless 0): with frame generation our swap
+/// chain has [`framegen_buffers`] buffers and presents with tearing allowed
+/// where the system has it. Off: two buffers, no tearing, as before (then
+/// Streamline's pacer held our present 40-50 ms a frame and the title at 15
+/// rendered / 30 shown in most runs, r58 and r61-r64).
+pub(crate) fn pacing_fix() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_FG_PACING_FIX").ok().is_none_or(|v| v.trim() != "0"))
+}
+
+/// The buffers of our swap chain with frame generation and the pacing fix:
+/// `VICTORY_FG_BUFFERS=2..8`, 3 unless set (one shown, the generated and the
+/// rendered frame of 2x queued behind it).
+pub(crate) fn framegen_buffers() -> u32 {
+    std::env::var("VICTORY_FG_BUFFERS").ok().and_then(|v| v.trim().parse::<u32>().ok()).map_or(3, |n| n.clamp(2, 8))
+}
+
+/// The buffers our swap chain was made with, told to frame generation.
+static BACK_BUFFERS: AtomicU32 = AtomicU32::new(2);
+
+pub(crate) fn set_back_buffers(buffers: u32) {
+    BACK_BUFFERS.store(buffers, Relaxed);
 }
 
 /// The swap chain was made through the proxy (or not, after all: then
@@ -1490,7 +1516,7 @@ pub(crate) fn present_begins(frame: u64, planes: Planes<'_>) -> Option<Presentin
         options.num_frames_to_generate = generated;
         FG_TIMES.store(generated + 1, Relaxed);
         options.flags = abi::DLSSG_RETAIN_RESOURCES_WHEN_OFF;
-        options.num_back_buffers = 2;
+        options.num_back_buffers = BACK_BUFFERS.load(Relaxed);
         options.color_width = planes.size[0];
         options.color_height = planes.size[1];
         options.on_error_callback = Some(present_error);

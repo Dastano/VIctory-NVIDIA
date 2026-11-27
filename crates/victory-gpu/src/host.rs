@@ -9894,11 +9894,55 @@ pub(crate) fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
 
 const BUFFERS: u32 = 2;
 
+/// How our swap chain is made and presented to: its buffer count and flags,
+/// and the flags of each present.
+#[derive(Clone, Copy)]
+struct SwapSetup {
+    buffers: u32,
+    flags: DXGI_SWAP_CHAIN_FLAG,
+    present: DXGI_PRESENT,
+}
+
+impl SwapSetup {
+    const PLAIN: Self = Self { buffers: BUFFERS, flags: DXGI_SWAP_CHAIN_FLAG(0), present: DXGI_PRESENT(0) };
+
+    /// With frame generation and `VICTORY_FG_PACING_FIX` (on unless 0): more
+    /// buffers (Streamline's pacer queues as many presents as the swap chain
+    /// has buffers, and 2x shows two a frame) and tearing allowed where the
+    /// system has it, so that a present of ours never waits for the display.
+    /// With two buffers and no tearing the pacer held the present 40-50 ms
+    /// and the title at 15 rendered / 30 shown (runs r58, r61-r64).
+    fn framegen(factory: &IDXGIFactory2) -> Self {
+        if !crate::streamline::pacing_fix() {
+            return Self::PLAIN;
+        }
+        let tearing = factory.cast::<IDXGIFactory5>().is_ok_and(|f| {
+            let mut allow = windows::core::BOOL(0);
+            // SAFETY: a BOOL to fill, its size given.
+            unsafe {
+                f.CheckFeatureSupport(
+                    DXGI_FEATURE_PRESENT_ALLOW_TEARING,
+                    std::ptr::from_mut(&mut allow).cast(),
+                    std::mem::size_of::<windows::core::BOOL>() as u32,
+                )
+            }
+            .is_ok()
+                && allow.as_bool()
+        });
+        Self {
+            buffers: crate::streamline::framegen_buffers(),
+            flags: if tearing { DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING } else { DXGI_SWAP_CHAIN_FLAG(0) },
+            present: if tearing { DXGI_PRESENT_ALLOW_TEARING } else { DXGI_PRESENT(0) },
+        }
+    }
+}
+
 struct Presenter {
     swap_chain: IDXGISwapChain3,
     width: u32,
     height: u32,
     format: DXGI_FORMAT,
+    setup: SwapSetup,
     copy: HostList,
     /// With presents sent ahead ([`late_free_present`]): a list for each
     /// present in the air, and the submission it last flew as (it is used
@@ -10493,7 +10537,7 @@ impl Host {
             // SAFETY: no back buffer is held; every submission was waited for.
             let resized = unsafe {
                 p.swap_chain
-                    .ResizeBuffers(BUFFERS, width, height, format, DXGI_SWAP_CHAIN_FLAG(0))
+                    .ResizeBuffers(p.setup.buffers, width, height, format, p.setup.flags)
             };
             match resized {
                 Ok(()) => {
@@ -10719,7 +10763,7 @@ impl Host {
                 },
             );
             let called = crate::streamline::present_called(&presenting);
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let _ = p.swap_chain.Present(0, p.setup.present);
             crate::streamline::present_returned(called);
             crate::streamline::present_ends(presenting);
             showing.next("the frame meter");
@@ -10756,7 +10800,7 @@ impl Host {
         // SAFETY: plain object creation for our window.
         unsafe {
             let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
-            let desc = DXGI_SWAP_CHAIN_DESC1 {
+            let desc_of = |setup: SwapSetup| DXGI_SWAP_CHAIN_DESC1 {
                 Width: width,
                 Height: height,
                 Format: format,
@@ -10765,19 +10809,31 @@ impl Host {
                     Quality: 0,
                 },
                 BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
-                BufferCount: BUFFERS,
+                BufferCount: setup.buffers,
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+                Flags: setup.flags.0 as u32,
                 ..Default::default()
             };
+            let mut setup = SwapSetup::PLAIN;
+            let desc = desc_of(setup);
             // With frame generation, through Streamline's factory proxy and
             // on its queue proxy: the swap chain is its proxy.
+            let framegen = SwapSetup::framegen(&factory);
             let proxied = crate::streamline::swap_chain_factory(&factory).map(|(proxy, queue)| {
                 proxy
-                    .CreateSwapChainForHwnd(&queue, hwnd, &desc, None, None)
+                    .CreateSwapChainForHwnd(&queue, hwnd, &desc_of(framegen), None, None)
                     .and_then(|s| s.cast::<IDXGISwapChain3>())
             });
             let swap_chain = match proxied {
                 Some(Ok(swap_chain)) => {
+                    setup = framegen;
+                    crate::streamline::set_back_buffers(setup.buffers);
+                    tracing::info!(
+                        buffers = setup.buffers,
+                        tearing = setup.flags != DXGI_SWAP_CHAIN_FLAG(0),
+                        fix = crate::streamline::pacing_fix(),
+                        "DLSS Frame Generation: the swap chain's buffers and tearing (VICTORY_FG_PACING_FIX)"
+                    );
                     crate::streamline::swap_chain_made(true, None);
                     // Frame generation must be off across a change between
                     // windowed and full screen (Streamline's guide, 12.0):
@@ -10806,6 +10862,7 @@ impl Host {
                 width,
                 height,
                 format,
+                setup,
                 copy,
                 ahead: Vec::new(),
                 hwnd,
