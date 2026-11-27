@@ -166,3 +166,7 @@ r73: the same as r72 with the game window moved onto the display the RTX 4090 dr
 on the primary display, a Parsec virtual display): 27.7 rendered fps mean, 31 presents / 61 frames shown a second,
 7 ms in the present. So the 15/30 lock came from presenting on a display not on the 4090. Play with the window on
 a display connected to the 4090 (and the Parsec virtual display off or not primary).
+
+r74 (walking, DLAA, no frame generation, window on the 4090's display): 29.30 fps mean, over 50 ms 342, longest
+186 ms: the same as r70 on the Parsec display (29.33). Without frame generation the display does not matter;
+the remaining gap to 30 is the submitting thread's work in heavy frames.
