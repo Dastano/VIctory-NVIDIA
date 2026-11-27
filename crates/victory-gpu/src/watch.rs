@@ -443,9 +443,9 @@ const AHEAD_MAX: usize = (1 << 30) / PAGE;
 const FAST_GAP: usize = (256 << 10) / PAGE;
 
 /// Whether a submission's askings walk less and wait less
-/// (`VICTORY_WATCH_FAST=0`: as before; on by default, as every range a
+/// (`VICTORY_WATCH_FAST=1`; off by default, see the end): every range a
 /// submission refreshes is still asked at the same moment as before, by the
-/// same kind of kernel call, only fewer pages beside them).
+/// same kind of kernel call, only fewer pages beside them.
 ///
 /// An asking costs what it walks, not what it finds: 0.6-0.9 microseconds a
 /// MiB of title memory, written or not, and some 0.3 for the call (timed on
@@ -468,8 +468,13 @@ const FAST_GAP: usize = (256 << 10) / PAGE;
 ///   each other in the kernel, and stay on one thread). The submission's
 ///   range stays held ([`Asking::hold_all`]) the while, and what they found
 ///   is noted under one number after all of them, as before.
+///
+/// OFF by default (`VICTORY_WATCH_FAST=1` turns it on): in the RTX 4090 PC's
+/// run r56 (walking through the jail, 7,000 draws) the submitting thread's
+/// askings took 264-267 ms a frame with it, against 3-4 ms without.
 fn fast() -> bool {
-    crate::toggled!("VICTORY_WATCH_FAST")
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WATCH_FAST").is_some_and(|v| v == "1"))
 }
 
 /// The gap across which a submission's ranges are asked together.
