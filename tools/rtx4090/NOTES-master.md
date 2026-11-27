@@ -258,3 +258,14 @@ r95 (`VICTORY_GUARD_SHARDS=1`: the guards' lock split into 64 region locks, refr
 perf/guard-shards, merged, off by default): 38.4 fps, 13 of 89 lines under 29.5, over 50 ms 277, longest 315 ms:
 no change from r88/r89; no deadlock or fault. The lock waits were not what set the slow seconds. Its diagnostics
 split of lock waits by holder stays in for the next diagnostics run.
+
+## Driving the boat (r96)
+
+At the user's suggestion the route now drives: RT held (key C) from 240 s, left stick left/right every 16 s,
+camera turns (`gx-workers\boatdrive-keys.txt`). r96 (DLSS Quality, no cap): the boat runs at speed through the
+bay after the plane, once onto the shore road (reset prompt). Picture clean, water lit with wake, no black boxes.
+32.3 fps mean, 44 of 97 lines under 29.5 (26 under 27), over 50 ms 615, longest 345 ms: driving streams the
+world much faster than walking and is the harder benchmark from now on.
+New in other forks (20:37, summarised by the GX Cube): trustno1's MFG Unlocker (frame generation for RTX 20/30;
+nothing for an RTX 40), Victory-Lap play29-31 (its biggest win, VICTORY_BVH_LOG_ONCE, concerns its BVH stand-in
+we do not run; constants in card memory saves card time, not our CPU limit): not taken.
