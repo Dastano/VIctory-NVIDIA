@@ -274,3 +274,8 @@ r97/r98 (boat drive; `VICTORY_CARD_FILLS`: fills around a copy at its place done
 flights, perf/card-fills, on): on 32.9 fps, 42 of 99 lines under 29.5 (24 under 27), over 50 ms 1,012; off (r98,
 same build) 32.9 fps, 48 under 29.5 (29 under 27), over 50 ms 625. A draw within the boat route's run-to-run
 spread; left on (byte-identical by its test, fewer dips).
+
+r99 (boat drive; `VICTORY_RELAY_TEX_WIDE`: a flight's texture read-backs land on the landing threads at once,
+overlapping ones in order; perf/relay, on): 33.8 fps mean (r97/r98: 32.9), 35 of 98 lines under 29.5 (r97/r98:
+42-48), 21 under 27 (24-29), lowest line 19.2 (6.8-7.7). The relay's texture read-backs: 14.0 a frame, all 14 at
+once, 0.74 ms of "read-backs and lists" (about 4.5 ms before in slow seconds).
