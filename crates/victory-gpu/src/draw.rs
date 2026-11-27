@@ -3853,7 +3853,10 @@ impl State {
         // depth read is the opaque one behind them; outdoors on water that is
         // the bottom, the reflected direction is wrong and the estimate dark
         // (play session 2026-11-27: dark patches on the water around a boat).
-        let alpha_too = std::env::var("VICTORY_AMBIENT_SPECULAR_ALPHA").is_ok_and(|v| v.trim() == "1");
+        // On again by default (2026-11-27): those dark patches were water tiles the tile
+        // list had dropped (`VICTORY_LOOPS_WAVE`), not this; without it glass in a dark room
+        // mirrors the bright sky (run fix2, spectacles 75 s into the opening). `=0`: off.
+        let alpha_too = !std::env::var("VICTORY_AMBIENT_SPECULAR_ALPHA").is_ok_and(|v| v.trim() == "0");
         if role == Role::Miss
             && !(layer == crate::ambient::MISS_OPAQUE || (alpha_too && layer == crate::ambient::MISS_ALPHA))
         {
@@ -4000,6 +4003,56 @@ impl State {
                             d.Width.abs_diff(w * 2) <= 1 && u64::from(d.Height).abs_diff(u64::from(h) * 2) <= 1
                         })
                 })
+            })
+            .or_else(|| {
+                // In the opening's cutscenes the miss program's own places hold no depth of
+                // the picture (its usual place a 1x1 texture; run loops1: no stand-in for 80 s,
+                // reflections of the bright sky in dark rooms and on eyes). The picture's
+                // depth is still in the frame's table, at a place this program does not read
+                // (capture haze2: place 752 of table 0, the depth plane of the depth-stencil
+                // target; place 448 its stencil plane). So: every place of that table, the
+                // depth-stencil target's depth plane first, then any 32-bit depth of that size.
+                use windows::Win32::Graphics::Dxgi::Common::{
+                    DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_D32_FLOAT_S8X24_UINT, DXGI_FORMAT_R32_TYPELESS,
+                    DXGI_FORMAT_R32G8X24_TYPELESS,
+                };
+                let (w, h) = image.as_ref().map(|(d, _)| (d.Width, d.Height))?;
+                let Some(Root::Table(table)) = self.roots_ref(true).first() else { return None };
+                let start = match self.ambient_tables.iter().find(|m| m.0 == 0) {
+                    Some(m) => m.1,
+                    None => self.user_value(true, 0, RootType::Table, 0),
+                };
+                let mut plain = None;
+                for offset in (0..1600u32).step_by(8) {
+                    let Some(view) = crate::descriptor::view(table + u64::from(offset) * 4) else { continue };
+                    if stencil_view(Some(view.clone())) {
+                        continue;
+                    }
+                    let view = crate::descriptor::host::placed_texture(&view).unwrap_or(view);
+                    let View::Shader(resource, _) = view else { continue };
+                    let Some(host) = crate::resource::host_resource(resource as This) else { continue };
+                    // SAFETY: a live resource.
+                    let d = unsafe { host.GetDesc() };
+                    let fits = d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+                        && d.Width.abs_diff(w * 2) <= 1
+                        && u64::from(d.Height).abs_diff(u64::from(h) * 2) <= 1;
+                    if !fits {
+                        continue;
+                    }
+                    let found = (d, heap.gpu_handle((start + offset * 4) / 32));
+                    match d.Format {
+                        DXGI_FORMAT_R32G8X24_TYPELESS | DXGI_FORMAT_D32_FLOAT_S8X24_UINT => {
+                            static WIDE: AtomicU64 = AtomicU64::new(0);
+                            if WIDE.fetch_add(1, Ordering::Relaxed) == 0 {
+                                tracing::info!(offset, "reflections stand-in: the picture's depth taken from the frame's table, a place the miss program does not read (counted once)");
+                            }
+                            return Some(found);
+                        }
+                        DXGI_FORMAT_R32_TYPELESS | DXGI_FORMAT_D32_FLOAT if plain.is_none() => plain = Some(found),
+                        _ => {}
+                    }
+                }
+                plain
             }),
             Role::Radiance | Role::Air => image,
         };
@@ -5936,13 +5989,15 @@ static PASS_FRAME_NANOS: AtomicU64 = AtomicU64::new(0);
 /// now; runs before a bake keep their own budget.
 ///
 /// The pass runs several times a frame (its own, the early one at the
-/// frame's first draw, 16 ms each in the launcher): walking in run r82 it
-/// took 2.2-2.7 s of each 5 seconds in the stretches with frames over 50 ms
-/// (15:34:09-15:34:39: 23,000-34,000 slots served for the first time, 3,000
-/// uploads a second, every one of them a staging buffer made for it and
-/// detiled whole), 0.6-0.9 s in calm ones. What changes for the picture: a
-/// texture picked by index may show a frame or more later in such a burst
-/// (its slot shows what it showed until then, `VICTORY_SHOW_NEW_LATER`).
+/// frame's first draw, 16 ms each in the launcher): walking through the
+/// world it took 2.2-2.7 s of each 5 seconds in the stretches with frames
+/// over 50 ms (3,000 uploads a second, every one through a staging buffer
+/// made for it and detiled whole), 0.6-0.9 s in calm ones. With 8 ms (RTX
+/// 4090, Ryzen 9 7950X3D, DLSS Quality, no frame cap, the walking route
+/// through the first boat mission) the mean went from 39.4 to 47.0 fps.
+/// What changes for the picture: a texture picked by index may show a frame
+/// or more later in such a burst (its slot shows what it showed until then,
+/// `VICTORY_SHOW_NEW_LATER`).
 fn texspk_pass_ms() -> Option<u64> {
     static MS: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     *MS.get_or_init(|| {
