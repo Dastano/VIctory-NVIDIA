@@ -124,7 +124,7 @@ pub use lower::{host_settings, set_host_max_wave, set_host_rdna};
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, SLOT_TABLE_STRIDES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+    SLOT_STRIDES_COUNT, SLOT_TABLE_STRIDES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_BVH_EMPTY, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     constants_raw, raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
 };
 
@@ -171,6 +171,42 @@ const DEPTH_STENCIL_EXPORT: u32 = 0b111;
 thread_local! {
     /// [`early_depth`] for the tests of one thread.
     static EARLY_DEPTH_FOR_TESTS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// [`probe_rays`] for the tests of one thread (unset: off, as the tests
+    /// were written).
+    pub(crate) static PROBE_RAYS_FOR_TESTS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// `VICTORY_PROBE_RAYS` (Op-lite/victory-scarlett 183ac80): with the
+/// ray-tracing structure builder off, every node test
+/// (`image_bvh_intersect_ray`, `intersect.rs`) answers as against an empty
+/// structure, which the host says with [`USER_BVH_EMPTY`]: a box node's four
+/// children are none, a triangle is missed. The title's traversal then ends
+/// at its first node with the miss it computes for a ray that finds nothing,
+/// instead of walking memory of a structure that was never built. With it the
+/// screen probes' `CS_ScreenProbes_ActivateRays` is made and runs
+/// (`victory-gpu`'s `pipeline::make`), so no probe keeps the stale memory that
+/// showed as violet bushes, trees and palms; their rays miss and take the
+/// sky. Only programs with a node test translate differently.
+/// - unset: on, unless `VICTORY_BVH_BUILDER=1` (the structures are built).
+/// - `1`: on; `0`: off (the probes' activation is left out, as before).
+///
+/// Part of the translation: the shader cache keys on it (`victory-gpu`'s
+/// does, while it is on).
+pub fn probe_rays() -> bool {
+    #[cfg(test)]
+    return PROBE_RAYS_FOR_TESTS.with(std::cell::Cell::get).unwrap_or(false);
+    #[cfg(not(test))]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| match std::env::var_os("VICTORY_PROBE_RAYS") {
+            Some(v) => v == "1",
+            None => std::env::var_os("VICTORY_BVH_BUILDER").is_none_or(|v| v != "1"),
+        })
+    }
 }
 
 /// `VICTORY_EARLY_DEPTH=1`: a pixel program whose console code tests depth and

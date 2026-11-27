@@ -94,6 +94,17 @@ fn build() -> [u8; 32] {
             bytes.extend_from_slice(b"VICTORY_EARLY_DEPTH=1");
             bytes.push(0);
         }
+        // So is whether node tests ask the host if the structure is empty
+        // (`VICTORY_PROBE_RAYS`, `victory_shader::emit::probe_rays`; on by
+        // default while the builder is off): only while it is on, so that
+        // the translations cached without it are still served without it.
+        if victory_shader::emit::probe_rays() {
+            tracing::info!(
+                "VICTORY_PROBE_RAYS: ray-tracing node tests answer as for an empty structure while the builder is off; the screen probes' rays are activated"
+            );
+            bytes.extend_from_slice(b"VICTORY_PROBE_RAYS=1");
+            bytes.push(0);
+        }
         // And which clean-up passes ran over the translated code.
         bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
         // So is renderer port 5 (`VICTORY_PORT_CBV=1`, constant buffers read

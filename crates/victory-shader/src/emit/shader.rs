@@ -99,6 +99,12 @@ pub const USER_ROOT_ADDRESS: u32 = 0x104;
 /// the group's width. Asked for by the structure builder's programs
 /// ([`crate::spill::is_spilled`]).
 pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
+/// (`VICTORY_PROBE_RAYS`, [`super::probe_rays`]) `RootType::Other` code of a
+/// user-data dword the host sets: nonzero while the title's ray-tracing
+/// structures are not built (the structure builder is off). A node test then
+/// answers as for a structure with nothing in it. (Op-lite/victory-scarlett
+/// 183ac80.)
+pub const USER_BVH_EMPTY: u32 = 0x108;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {

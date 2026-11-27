@@ -97,6 +97,11 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
         if builder {
             return std::env::var_os("VICTORY_ACTIVATE_RAYS").is_some_and(|v| v == "0");
         }
+        // `VICTORY_PROBE_RAYS` (`victory_shader::emit::probe_rays`): made,
+        // its rays (and all others) missing an empty structure.
+        if victory_shader::emit::probe_rays() {
+            return std::env::var_os("VICTORY_ACTIVATE_RAYS").is_some_and(|v| v == "0");
+        }
         std::env::var_os("VICTORY_ACTIVATE_RAYS").is_none_or(|v| v == "0")
     });
     if skip_activate && named(shaders, b"CS_ScreenProbes_ActivateRays") {
