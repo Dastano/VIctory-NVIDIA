@@ -180,3 +180,14 @@ time "while the title had not submitted", i.e. the title's own threads (its code
 r76 (`VICTORY_COPY_BESIDE=1`, `VICTORY_STORE_BESIDE=1`: the title's writes into guarded blocks done beside the
 guards): 29.42 fps (r75: 29.34), preparing 18.1 ms, over 50 ms 355: within noise; left off (they emulate the
 title's stores, a fault there would corrupt title data for ~0.1 fps).
+
+## Round 2 of fork updates and the water fixed (r78-r80)
+
+master now also has trustno1 main up to d12eb1b (BC7 rotation, violet probe garbage, raw view clamp, helper
+priority, skip-bink, F1 mouse, Vice-Tay's group-counter lanes), foxhound 9f8838b (static-sampler order, cloud tile
+sort: VICTORY_LDS_LOOP_ATOMICS / VICTORY_LDS_BOUNDS, buffer pool) and foxhound 454ffea's water fixes
+(VICTORY_LOOPS_WAVE, VICTORY_LDS_FIRST_INIT, a skip kept before a loop that would never end); the water's tiled
+light runs by default again. r79 (walking, DLAA): 29.17 fps, preparing 16.5-19.5 ms in play. r80 (the same,
+shots every 8 s, window on the primary display): the open water around the boat is lit (turquoise) with no black
+blocks anywhere in the top-down shots; 29.1 fps over the last 2 minutes. Not taken: soldier16's two-stage submit
+pipelining (a possible race; tied to its other changes).
