@@ -963,6 +963,13 @@ fn rest_to_ask(ranges: &[(usize, usize)], ahead: &Ahead) -> (Vec<(usize, usize)>
     (to_ask, skipped)
 }
 
+/// Whether the submission's one asking stands ([`ask_once`] until
+/// [`ask_once_end`], both on the submitting thread): [`ask_ahead`] then
+/// asks nothing, whatever ranges it is given.
+pub(crate) fn kept() -> bool {
+    journal().kept
+}
+
 /// The submission's one asking stands no longer: its refreshes are done,
 /// or title memory was written in a way the journal was not told.
 pub(crate) fn ask_once_end() {

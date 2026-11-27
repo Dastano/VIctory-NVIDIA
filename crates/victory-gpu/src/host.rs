@@ -4488,7 +4488,9 @@ impl Host {
             None => 0,
         };
         let gathering = crate::timeline::span("copies in the card's memory: what changed");
+        let changed = std::time::Instant::now();
         let mut dirty = crate::shadow::card_dirty(sent_as);
+        card_part(2, changed);
         gathering.end();
         if declared.is_empty() && dirty.is_empty() && looked.is_empty() {
             return None;
@@ -4514,8 +4516,11 @@ impl Host {
         let mut looks = None;
         // The bytes as they are now, whatever later submissions put there.
         let taking = crate::timeline::span("copies in the card's memory: taken");
+        let taken = std::time::Instant::now();
         let own = if send::own() { send::take(self, &dirty) } else { None };
+        card_part(3, taken);
         taking.end();
+        let recording = std::time::Instant::now();
         if !dirty.is_empty() {
             let Some(sync) = work.sync.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!("no host list to bring host copies in the card's memory up to date"));
@@ -4617,6 +4622,7 @@ impl Host {
             }
             used.push((false, sync));
         }
+        card_part(4, recording);
         drop(order);
         let mut plan = CardPlan {
             ranges: Vec::new(),
@@ -5909,7 +5915,9 @@ impl Host {
             let settling = std::time::Instant::now();
             self.settle(&mut submitted, WHY_MOST);
             settled += settling.elapsed();
+            card_part(0, settling);
         }
+        let declaring = std::time::Instant::now();
         // What shaders may write through views they pick: last, so that no
         // refresh of this submission leaves it alone.
         let picked = crate::picked::declare(runs);
@@ -5917,6 +5925,7 @@ impl Host {
             shadow.writing(*at, *len);
         }
         let declared = declared_writes(runs);
+        card_part(1, declaring);
         let card = self.card_before(&declared, &picked, flown);
         if let Some(probe) = probe {
             let finished = FINISHED.load(Ordering::Acquire);
@@ -8010,6 +8019,37 @@ static SPLIT: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::A
 /// those known to copy nothing, and those done on several threads.
 static FLUSHES: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
+/// Since the last frame-rate line, where the refreshes' time of the
+/// submitting thread (`SPLIT[6]`) goes, in every build (a few clock reads
+/// a flush): [0] nanoseconds of looks on it (`Shadow::nothing_new` before
+/// any thread is woken), [1] how many; [2] nanoseconds asking ahead
+/// (`crate::watch::ask_ahead`); [3] nanoseconds of refreshes done one at a
+/// time on it, [4] how many; [5] nanoseconds of the passes on several
+/// threads, from the waking to the last one done (the textures among a
+/// front's), [6] how many passes; [7] the nanoseconds of all refreshes
+/// ([`Batch::update`]) summed over the threads that did them, [8] the bytes
+/// they copied.
+static REFRESH_PARTS: [std::sync::atomic::AtomicU64; 9] = [const { std::sync::atomic::AtomicU64::new(0) }; 9];
+
+/// Since the last frame-rate line, where the submitting thread's "copies in
+/// the card's memory" (`SPLIT[4]`) go, in every build, nanoseconds: [0]
+/// flights settled for room for the compare's results, [1] the writes
+/// declared (picked views, their snapshots noted), and in
+/// [`Host::card_before`]: [2] what changed gathered
+/// (`crate::shadow::card_dirty`), [3] its bytes taken (`send::take`), [4]
+/// the list that sends them recorded and sent.
+static CARD_PARTS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// Adds the nanoseconds since `since` to [`CARD_PARTS`]`[i]`.
+fn card_part(i: usize, since: std::time::Instant) {
+    CARD_PARTS[i].fetch_add(since.elapsed().as_nanos() as u64, Ordering::Relaxed);
+}
+
+/// Adds the nanoseconds since `since` to [`REFRESH_PARTS`]`[i]`.
+fn refresh_part(i: usize, since: std::time::Instant) {
+    REFRESH_PARTS[i].fetch_add(since.elapsed().as_nanos() as u64, Ordering::Relaxed);
+}
+
 /// Since the last frame-rate line, nanoseconds of the submitting thread
 /// around its submissions ([`Host::send_late`]): after one is sent, its
 /// flight noted in the line, what settled meanwhile and the landed lists
@@ -8104,6 +8144,39 @@ fn submit_split_line(frames: f64) {
         ms[14],
         ms[15],
     );
+    let r: [f64; 9] = std::array::from_fn(|i| REFRESH_PARTS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+    if ms[6] > 0.0 {
+        tracing::info!(
+            "the refreshes ({:.1} ms) per frame, the submitting thread: {:.1} looking at {:.0} before waking threads, {:.1} asking \
+             ahead, {:.1} one at a time in {:.0}, {:.1} in {:.0} passes on several threads; refreshes summed over the threads \
+             {:.1} ms, {:.1} MB copied (VICTORY_REFRESH_WIDE is {})",
+            ms[6],
+            r[0] / 1e6,
+            r[1],
+            r[2] / 1e6,
+            r[3] / 1e6,
+            r[4],
+            r[5] / 1e6,
+            r[6],
+            r[7] / 1e6,
+            r[8] / 1e6,
+            if refresh_wide() { "on" } else { "off" },
+        );
+    }
+    let c: [f64; 5] = std::array::from_fn(|i| CARD_PARTS[i].swap(0, Ordering::Relaxed) as f64 / 1e6 / frames);
+    if ms[4] > 0.0 {
+        tracing::info!(
+            "copies in the card's memory ({:.1} ms) per frame, the submitting thread: {:.1} settling flights for the compare's \
+             room, {:.1} the writes declared, {:.1} what changed gathered, {:.1} its bytes taken, {:.1} the list that sends them \
+             recorded and sent; the rest the compare's list and the placed copies noted",
+            ms[4],
+            c[0],
+            c[1],
+            c[2],
+            c[3],
+            c[4],
+        );
+    }
     let [first, again] = [0, 1].map(|i| HEAP_SYNC_FIRST[i].swap(0, Ordering::Relaxed) as f64 / frames);
     if first + again > 0.0 {
         tracing::info!(
@@ -8632,9 +8705,73 @@ const SKIP_SHORT: usize = 64 * crate::watch::PAGE;
 /// copy nothing (`Shadow::nothing_new`) are left out, on this thread; how
 /// many.
 fn skip_known(refreshes: &mut Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>) -> usize {
+    let started = std::time::Instant::now();
     let all = refreshes.len();
     refreshes.retain(|(shadow, from, to)| *to - *from > SKIP_SHORT || !shadow.nothing_new(*from, *to - *from));
+    refresh_part(0, started);
+    REFRESH_PARTS[1].fetch_add(all as u64, Ordering::Relaxed);
     all - refreshes.len()
+}
+
+/// `VICTORY_REFRESH_WIDE` (read here; on by default, `=0` as before): how a
+/// flush of refreshes shares its work with the threads beside the
+/// submitting one, with the same refreshes done and the same bytes copied
+/// (each refresh writes its own copy and reads title memory, nothing of
+/// another's, so which thread does it and in which order is free):
+///
+/// - a flush of more than [`LOOK_WIDE`] refreshes, while the submission's
+///   one asking stands (so asking ahead asks nothing either way), leaves
+///   the looks at which copy nothing (`crate::watch::refresh_skip`) to the
+///   threads, each just before its refresh, as with more than 256 before
+///   `VICTORY_REFRESH_SKIP`: the submitting thread looked at thousands of
+///   them alone while the threads slept (6,775 of 8,022 a frame in the
+///   heavy scene), then woke them anyway for the rest;
+/// - the refreshes of long ranges (over [`SKIP_SHORT`]) are taken first,
+///   longest first, so that no long one starts last while the others idle;
+/// - two or three refreshes left in a flush, of [`PAIR_WIDE`] bytes or
+///   more together, go to several threads too (four or more did already);
+///   one at a time they were the submitting thread's alone.
+fn refresh_wide() -> bool {
+    #[cfg(test)]
+    if let Some(on) = REFRESH_WIDE_IN_TEST.get() {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_WIDE").is_none_or(|v| v != "0"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// [`refresh_wide`] for what this thread decides (`None`: as the
+    /// environment says).
+    static REFRESH_WIDE_IN_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// With [`refresh_wide`]: above this many refreshes in a flush the looks go
+/// to the threads (below it one waking costs more than they take).
+const LOOK_WIDE: usize = 512;
+
+/// With [`refresh_wide`]: two or three refreshes of ranges this long
+/// together go to several threads.
+const PAIR_WIDE: usize = 1 << 20;
+
+/// With [`refresh_wide`], whether a flush of `n` refreshes leaves its looks
+/// to the threads ([`refresh_wide`]'s first point).
+fn looks_beside(n: usize) -> bool {
+    refresh_wide() && n > LOOK_WIDE && crate::watch::kept()
+}
+
+/// With [`refresh_wide`]: `refreshes` with those of ranges over
+/// [`SKIP_SHORT`] first, longest first; the others after them in their
+/// order.
+fn long_first(refreshes: &mut Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>) {
+    if !refresh_wide() || !refreshes.iter().any(|r| r.2 - r.1 > SKIP_SHORT) {
+        return;
+    }
+    let (mut long, short): (Vec<_>, Vec<_>) = std::mem::take(refreshes).into_iter().partition(|r| r.2 - r.1 > SKIP_SHORT);
+    long.sort_by_key(|r| std::cmp::Reverse(r.2 - r.1));
+    long.extend(short);
+    *refreshes = long;
 }
 
 impl Batch {
@@ -8753,7 +8890,10 @@ impl Batch {
         let started = std::time::Instant::now();
         let _one = crate::timeline::span("a copy's refresh");
         let copied = shadow.update(from, to - from);
-        let us = started.elapsed().as_micros() as u64;
+        let took = started.elapsed();
+        REFRESH_PARTS[7].fetch_add(took.as_nanos() as u64, Ordering::Relaxed);
+        REFRESH_PARTS[8].fetch_add(copied as u64, Ordering::Relaxed);
+        let us = took.as_micros() as u64;
         #[cfg(feature = "diagnostics")]
         crate::copystat::range(from, to - from, us, 0);
         PREPARING[0].fetch_add(us, Ordering::Relaxed);
@@ -8882,20 +9022,29 @@ impl Batch {
         // (Renderer port #6: on the threads beside, whatever their number.)
         let many = spans.len() > FEW || crate::watch::port_guard_plan() && spans.len() + due.len() >= 4;
         if !many {
+            let looking = std::time::Instant::now();
             let all = spans.len();
             spans.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
+            refresh_part(0, looking);
+            REFRESH_PARTS[1].fetch_add(all as u64, Ordering::Relaxed);
             FLUSHES[2].fetch_add((all - spans.len()) as u64, Ordering::Relaxed);
-        } else if crate::watch::light() && crate::watch::refresh_skip() {
+        } else if crate::watch::light() && crate::watch::refresh_skip() && !looks_beside(spans.len()) {
             // The short ones here: no thread is woken for them, nor for
-            // none (`crate::watch::refresh_skip`).
+            // none (`crate::watch::refresh_skip`). (Very many: on the
+            // threads, `refresh_wide`.)
             FLUSHES[2].fetch_add(skip_known(&mut spans) as u64, Ordering::Relaxed);
         }
         let ahead = spans.len() > 1;
         if ahead {
+            let asking = std::time::Instant::now();
             let ranges: Vec<(usize, usize)> = spans.iter().filter(|r| r.0.asked_ahead()).map(|r| (r.1, r.2)).collect();
             crate::watch::ask_ahead(&ranges);
+            refresh_part(2, asking);
         }
+        long_first(&mut spans);
         FLUSHES[3].fetch_add(spans.len() as u64, Ordering::Relaxed);
+        let passing = std::time::Instant::now();
+        let passes = spans.len() + due.len();
         crate::shadow::wide_each(spans.len() + due.len(), move |i| {
             // The textures first: they are the longer pieces.
             let Some(i) = i.checked_sub(due.len()) else {
@@ -8909,6 +9058,14 @@ impl Batch {
             }
             Self::update(shadow, *from, *to);
         });
+        // (One alone is done on this thread, `crate::shadow::wide_each`.)
+        if passes == 1 {
+            refresh_part(3, passing);
+            REFRESH_PARTS[4].fetch_add(1, Ordering::Relaxed);
+        } else if passes > 1 {
+            refresh_part(5, passing);
+            REFRESH_PARTS[6].fetch_add(1, Ordering::Relaxed);
+        }
         if ahead {
             crate::watch::ask_ahead_done();
         }
@@ -9034,8 +9191,11 @@ impl Batch {
             let all = self.refreshes.len();
             self.refreshes.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+            refresh_part(0, started);
+            REFRESH_PARTS[1].fetch_add(all as u64, Ordering::Relaxed);
             FLUSHES[2].fetch_add((all - self.refreshes.len()) as u64, Ordering::Relaxed);
-        } else if light && crate::watch::refresh_skip() {
+        } else if light && crate::watch::refresh_skip() && !(wide_refresh() && looks_beside(self.refreshes.len())) {
+            // (Very many: on the threads, below, `refresh_wide`.)
             // The short ones here, before anything is asked: a flush left
             // with none or few wakes no thread (`crate::watch::refresh_skip`).
             let started = std::time::Instant::now();
@@ -9055,8 +9215,16 @@ impl Batch {
                 .collect();
             crate::watch::ask_ahead(&ranges);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+            refresh_part(2, started);
         }
-        if wide_refresh() && self.refreshes.len() >= 4 {
+        // Two or three left, long together: on several threads too
+        // (`refresh_wide`), and done as one at a time does them (no look).
+        let n = self.refreshes.len();
+        let pair = light
+            && (2..4).contains(&n)
+            && refresh_wide()
+            && self.refreshes.iter().map(|r| r.2 - r.1).sum::<usize>() >= PAIR_WIDE;
+        if wide_refresh() && (n >= 4 || pair) {
             // Each copy on its own, several at a time: a copy's refresh
             // writes that copy and reads title memory, nothing of another's.
             // The time counted is the time it took, not the threads' sum.
@@ -9065,10 +9233,12 @@ impl Batch {
             FLUSHES[3].fetch_add(self.refreshes.len() as u64, Ordering::Relaxed);
             if light {
                 // A number to a free thread, not a job to each copy.
-                let refreshes = std::mem::take(&mut self.refreshes);
+                let look = !pair && (n > FEW || beside);
+                let mut refreshes = std::mem::take(&mut self.refreshes);
+                long_first(&mut refreshes);
                 crate::shadow::wide_each(refreshes.len(), move |i| {
                     let (shadow, from, to) = &refreshes[i];
-                    if (refreshes.len() > FEW || beside) && shadow.nothing_new(*from, *to - *from) {
+                    if look && shadow.nothing_new(*from, *to - *from) {
                         FLUSHES[2].fetch_add(1, Ordering::Relaxed);
                         return;
                     }
@@ -9084,10 +9254,15 @@ impl Batch {
             }
             let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
             PREPARING[0].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
-        } else {
+            refresh_part(5, started);
+            REFRESH_PARTS[6].fetch_add(1, Ordering::Relaxed);
+        } else if n > 0 {
+            let started = std::time::Instant::now();
             for (shadow, from, to) in self.refreshes.drain(..) {
                 Self::update(&shadow, from, to);
             }
+            refresh_part(3, started);
+            REFRESH_PARTS[4].fetch_add(n as u64, Ordering::Relaxed);
         }
         if ahead {
             crate::watch::ask_ahead_done();
@@ -11211,6 +11386,108 @@ mod refresh_tests {
         crate::watch::PORT_GUARD_IN_TEST.set(true);
         refreshed_ranges_hold_title_memory();
         crate::watch::PORT_GUARD_IN_TEST.set(false);
+    }
+
+    /// `VICTORY_REFRESH_WIDE` moves only where and when a flush's refreshes
+    /// are done (`super::refresh_wide`): two sets of copies of the same title
+    /// memory, one refreshed with it off and one with it on, in flushes of
+    /// more than `LOOK_WIDE` copies (long ones among them), and of two and
+    /// three long ones, hold the same bytes after every submission, and
+    /// those of title memory, with renderer port #6's planning beside and
+    /// without.
+    #[test]
+    fn refresh_wide_copies_the_same_bytes() {
+        const SMALL: usize = 16 << 10;
+        const MANY: usize = super::LOOK_WIDE + 88;
+        const LONG: usize = 5 << 20;
+        const MID: usize = 512 << 10;
+        let small_region = title(MANY * SMALL, false);
+        let long_region = title(2 * LONG, false);
+        let mid_region = title(3 * MID, false);
+        // SAFETY (all blocks): the test's own memory, which only this thread
+        // writes and the refreshing threads read, done when a flush returns.
+        unsafe {
+            std::ptr::write_bytes(small_region as *mut u8, 1, MANY * SMALL);
+            std::ptr::write_bytes(long_region as *mut u8, 2, 2 * LONG);
+            std::ptr::write_bytes(mid_region as *mut u8, 3, 3 * MID);
+        }
+        let regions = [(small_region, MANY * SMALL), (long_region, 2 * LONG), (mid_region, 3 * MID)];
+        // (A copy, its bytes, the range refreshed.)
+        type World = Vec<(Arc<Shadow>, *mut u8, usize, usize)>;
+        let world = || -> World {
+            let mut copies = Vec::new();
+            for i in 0..MANY {
+                let at = small_region + i * SMALL;
+                let data = memory(SMALL);
+                copies.push((Shadow::unbacked(at as u64, data, SMALL as u64, false), data, at + 100 * (i % 7), SMALL - 100 * (i % 7) - 300 * (i % 5)));
+            }
+            for (start, len, n) in [(long_region, LONG, 2), (mid_region, MID, 3)] {
+                for i in 0..n {
+                    let at = start + i * len;
+                    let data = memory(len);
+                    copies.push((Shadow::unbacked(at as u64, data, len as u64, false), data, at + 40, len - 80));
+                }
+            }
+            copies
+        };
+        let (off, on) = (world(), world());
+        let mut random = Random(0x0F1E_2D3C_4B5A_6978);
+        for beside in [true, false] {
+            crate::watch::PORT_GUARD_IN_TEST.set(beside);
+            for round in 0..24 {
+                let writes = if round == 0 { 0 } else { 1 + random.below(40) };
+                for _ in 0..writes {
+                    let (start, len) = regions[random.below(3)];
+                    let at = start + random.below(len - 64);
+                    for i in 0..1 + random.below(64) {
+                        unsafe { ((at + i) as *mut u8).write_volatile(random.below(256) as u8) };
+                    }
+                }
+                // All at once (more than `LOOK_WIDE`), the two long ones, the
+                // three of half a MiB.
+                let parts: [std::ops::Range<usize>; 3] = [0..MANY + 5, MANY..MANY + 2, MANY + 2..MANY + 5];
+                let part = parts[random.below(3)].clone();
+                for (wide, copies) in [(false, &off), (true, &on)] {
+                    super::REFRESH_WIDE_IN_TEST.set(Some(wide));
+                    let ranges: Vec<(Arc<Shadow>, usize, usize)> =
+                        copies[part.clone()].iter().map(|c| (c.0.clone(), c.2, c.3)).collect();
+                    submission(&ranges, 1);
+                }
+                super::REFRESH_WIDE_IN_TEST.set(None);
+                for (a, b) in off[part.clone()].iter().zip(&on[part.clone()]) {
+                    let start = a.0.span().0 as usize;
+                    let (title, x, y) = unsafe {
+                        (
+                            std::slice::from_raw_parts(a.2 as *const u8, a.3),
+                            std::slice::from_raw_parts(a.1.add(a.2 - start), a.3),
+                            std::slice::from_raw_parts(b.1.add(b.2 - start), b.3),
+                        )
+                    };
+                    assert!(x == y, "round {round} (beside {beside}): the copies of {:#x} differ", a.2);
+                    assert!(x == title, "round {round} (beside {beside}): {:#x} is not title memory", a.2);
+                }
+            }
+        }
+        crate::watch::PORT_GUARD_IN_TEST.set(false);
+    }
+
+    /// [`super::long_first`] puts the long ranges first, longest first, and
+    /// the others after them in their order; nothing is lost.
+    #[test]
+    fn long_first_keeps_every_refresh() {
+        let at = title(PAGE, false);
+        let copy = Shadow::unbacked(at as u64, memory(PAGE), PAGE as u64, false);
+        let short = super::SKIP_SHORT;
+        let lens = [10, short + 1, 30, 4 * short, 20, 2 * short];
+        let mut refreshes: Vec<(Arc<Shadow>, usize, usize)> = lens.iter().map(|&n| (copy.clone(), 1000, 1000 + n)).collect();
+        super::REFRESH_WIDE_IN_TEST.set(Some(true));
+        super::long_first(&mut refreshes);
+        let got: Vec<usize> = refreshes.iter().map(|r| r.2 - r.1).collect();
+        assert_eq!(got, [4 * short, 2 * short, short + 1, 10, 30, 20]);
+        super::REFRESH_WIDE_IN_TEST.set(Some(false));
+        super::long_first(&mut refreshes);
+        assert_eq!(refreshes.iter().map(|r| r.2 - r.1).collect::<Vec<_>>(), got);
+        super::REFRESH_WIDE_IN_TEST.set(None);
     }
 
     /// A copy in the card's memory, with the card's side and the sends to it
