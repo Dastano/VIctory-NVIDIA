@@ -170,3 +170,9 @@ a display connected to the 4090 (and the Parsec virtual display off or not prima
 r74 (walking, DLAA, no frame generation, window on the 4090's display): 29.30 fps mean, over 50 ms 342, longest
 186 ms: the same as r70 on the Parsec display (29.33). Without frame generation the display does not matter;
 the remaining gap to 30 is the submitting thread's work in heavy frames.
+
+r75 (`VICTORY_CC_TAKE_BESIDE`: a submission's sends copied on a thread beside the list recording): 29.34 fps,
+over 50 ms 363, longest 143 ms: no change from r74 (29.30). The submitting thread's preparing is now 18.6 ms on
+average; the frames over 40 ms are no longer explained by it alone: the card's clock line puts much of the idle
+time "while the title had not submitted", i.e. the title's own threads (its code plus our write guards' faults,
+~350 a frame) set those frames. Next lever, if any: the title threads' fault cost, not the submitting thread.
