@@ -101,7 +101,7 @@ pub(super) fn note(key: &str, shaders: &[Arc<Shader>], graphics: Option<&Graphic
     let mut entry = id.to_vec();
     entry.push(shaders.len() as u8);
     for s in shaders {
-        let hash = *blake3::hash(&s.container).as_bytes();
+        let hash = s.full_hash;
         let stage = STAGES.iter().position(|&x| x == s.stage).unwrap_or(0) as u8;
         entry.push(stage);
         entry.extend(hash);
@@ -123,7 +123,7 @@ pub(super) fn note(key: &str, shaders: &[Arc<Shader>], graphics: Option<&Graphic
 }
 
 /// Writes what was noted.
-fn flush() {
+pub(super) fn flush() {
     let Some(Some(book)) = BOOK.get() else { return };
     let (dir, new, added) = {
         let mut book = book.lock().unwrap_or_else(|e| e.into_inner());
@@ -133,6 +133,9 @@ fn flush() {
         (book.dir.clone(), std::mem::take(&mut book.new), std::mem::take(&mut book.added))
     };
     for (file, bytes) in [SHADERS, PIPELINES].iter().zip(&new) {
+        if bytes.is_empty() {
+            continue;
+        }
         let written = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -169,16 +172,42 @@ fn walk_shaders(dir: &Path, mut f: impl FnMut(u8, [u8; 32], u64, u32)) -> u64 {
 
 /// Calls `f` with each pipeline's number and entry; where the last whole one
 /// ends.
-fn walk_pipelines(dir: &Path, mut f: impl FnMut(usize, &[u8])) -> u64 {
-    let bytes = std::fs::read(dir.join(PIPELINES)).unwrap_or_default();
-    let (mut at, mut n) = (0, 0);
-    while let Some(head) = bytes.get(at..at + 4) {
-        let size = u32::from_le_bytes([head[0], head[1], head[2], head[3]]) as usize;
-        let Some(entry) = bytes.get(at + 4..at + 4 + size) else { break };
-        f(n, entry);
-        (at, n) = (at + 4 + size, n + 1);
+fn walk_pipelines(dir: &Path, f: impl FnMut(usize, &[u8])) -> u64 {
+    walk_pipelines_filtered(dir, |_| true, f)
+}
+
+/// Streams `known-pipelines.bin` and calls `f` only for pipeline indices where
+/// `want(n)` is true, seeking past the rest; returns where the last whole entry ends.
+fn walk_pipelines_filtered(
+    dir: &Path,
+    mut want: impl FnMut(usize) -> bool,
+    mut f: impl FnMut(usize, &[u8]),
+) -> u64 {
+    let Ok(file) = std::fs::File::open(dir.join(PIPELINES)) else { return 0 };
+    let len = file.metadata().map_or(0, |m| m.len());
+    let mut file = std::io::BufReader::new(file);
+    let (mut at, mut n) = (0u64, 0usize);
+    let mut head = [0u8; 4];
+    let mut buf = Vec::new();
+    while file.read_exact(&mut head).is_ok() {
+        let size = u32::from_le_bytes(head);
+        let end = at + 4 + u64::from(size);
+        if end > len {
+            break;
+        }
+        if want(n) {
+            buf.resize(size as usize, 0);
+            if file.read_exact(&mut buf).is_err() {
+                break;
+            }
+            f(n, &buf);
+        } else if file.seek_relative(i64::from(size)).is_err() {
+            break;
+        }
+        at = end;
+        n += 1;
     }
-    at as u64
+    at
 }
 
 /// How many pipelines are known in `dir`.
@@ -195,6 +224,31 @@ pub fn keys(dir: &Path) -> Vec<String> {
         all.push(e.get(..16).unwrap_or_default().iter().map(|b| format!("{b:02x}")).collect());
     });
     all
+}
+
+/// The key of each pipeline known in `dir` and the 64-bit hash prefix of
+/// each shader in it (matching `Shader::hash_u64` and `VICTORY_SKIP_PIPELINES`).
+pub fn entries(dir: &Path) -> Vec<(String, Vec<u64>)> {
+    let mut all = Vec::new();
+    walk_pipelines(dir, |_, e| {
+        let key: String = e.get(..16).unwrap_or_default().iter().map(|b| format!("{b:02x}")).collect();
+        let mut hashes = Vec::new();
+        if let Some((&count, mut rest)) = e.get(16..).and_then(|r| r.split_first()) {
+            for _ in 0..count {
+                let Some((head, after)) = rest.split_first_chunk::<33>() else { break };
+                rest = after;
+                let prefix: [u8; 8] = head[1..9].try_into().unwrap();
+                hashes.push(u64::from_be_bytes(prefix));
+            }
+        }
+        all.push((key, hashes));
+    });
+    all
+}
+
+/// Parses `VICTORY_SKIP_PIPELINES` into 64-bit shader hash prefixes.
+pub fn skip_hashes(value: &str) -> HashSet<u64> {
+    super::parse_skip_hashes_u64(value)
 }
 
 /// What a driver's cached pipelines depend on besides the title's: the
@@ -224,11 +278,13 @@ pub fn make(dir: &Path, which: &[usize], mut each: impl FnMut(usize, Option<(f64
     let Ok(mut file) = std::fs::File::open(dir.join(SHADERS)) else { return };
     let wanted: HashSet<usize> = which.iter().copied().collect();
     let mut entries = HashMap::new();
-    walk_pipelines(dir, |n, bytes| {
-        if wanted.contains(&n) {
+    walk_pipelines_filtered(
+        dir,
+        |n| wanted.contains(&n),
+        |n, bytes| {
             entries.insert(n, bytes.to_vec());
-        }
-    });
+        },
+    );
     let mut read = |hash: &[u8; 32]| {
         let &(_, at, len) = places.get(hash)?;
         let mut bytes = vec![0; len as usize];
@@ -475,6 +531,33 @@ mod tests {
         let mut seen = Vec::new();
         assert_eq!(walk_shaders(&dir, |stage, hash, at, len| seen.push((stage, hash[0], at, len))), one);
         assert_eq!(seen, [(5, 9, 37, 4)]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn entries_extract_keys_and_shader_hash_prefixes() {
+        let dir = std::env::temp_dir().join(format!("victory-known-entries-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut entry = vec![0xabu8; 16];
+        entry.push(2); // 2 shaders
+        entry.push(0); // vertex
+        entry.extend_from_slice(&[0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]);
+        entry.extend_from_slice(&[0u8; 24]);
+        entry.push(1); // pixel
+        entry.extend_from_slice(&[0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10]);
+        entry.extend_from_slice(&[0u8; 24]);
+        entry.push(0); // no graphics state
+
+        let mut file_bytes = Vec::new();
+        file_bytes.extend((entry.len() as u32).to_le_bytes());
+        file_bytes.extend(&entry);
+        std::fs::write(dir.join(PIPELINES), &file_bytes).unwrap();
+
+        let parsed = entries(&dir);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].0, "ab".repeat(16));
+        assert_eq!(parsed[0].1, vec![0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210]);
+        assert_eq!(skip_hashes("0123456789ABCDEF, none"), HashSet::from([0x0123_4567_89ab_cdef]));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

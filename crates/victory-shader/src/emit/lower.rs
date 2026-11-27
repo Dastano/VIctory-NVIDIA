@@ -10994,22 +10994,30 @@ impl<'a> Lower<'a> {
                 // d16: two f16 channels per VGPR, low half first.
                 let r = if *d16 { k / 2 } else { k };
                 let v = inst.read(Reg::V(reg + r)).ok_or("image store data")?;
-                vals.push(if *d16 {
+                let val = if *d16 {
                     let mut x = self.i32_of(v)?;
                     if k % 2 == 1 {
                         let k16 = self.s.m.i32(16);
                         x = self.s.m.bin(self.cur, Bin::LShr, x, k16);
                     }
                     let f32t = self.s.t.f32;
-                    self.s
-                        .op(self.cur, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x])
+                    let f = self
+                        .s
+                        .op(self.cur, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x]);
+                    self.scrub_nan(f)
                 } else {
-                    self.float_of(v)?
-                });
-            }
-            // LOCAL: `VICTORY_NAN_SCRUB=1` (see `scrub_nan`).
-            for v in &mut vals {
-                *v = self.scrub_nan(*v);
+                    let f = self.float_of(v)?;
+                    // LOCAL: `VICTORY_NAN_SCRUB=1` (see `scrub_nan`).
+                    // Never scrub integer/bitpacked UAV channels (e.g. R9G9B9E5
+                    // packed into R32_UINT, 0xFFFFFFFF sentinels, packed uint
+                    // normals/masks) whose bit patterns can have bits 30..23 == 0xFF.
+                    if self.is_integer_or_const(v) {
+                        f
+                    } else {
+                        self.scrub_nan(f)
+                    }
+                };
+                vals.push(val);
             }
             let h = self.handle(site, src, false, props)?;
             let at = self.begin_guarded(guard);
@@ -12195,6 +12203,82 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::V(reg + k as u8), x, guard);
         }
         Ok(())
+    }
+
+    /// Whether `v` is known to be an integer/bitpacked value or literal
+    /// constant rather than a computed float, so [`Self::scrub_nan`] does not
+    /// zero valid integer UAV writes (such as packed `R9G9B9E5` radiance in
+    /// `R32_UINT` or `0xFFFFFFFF` sentinel masks).
+    fn is_integer_or_const(&self, v: Value) -> bool {
+        if !nan_scrub() || self.floats.contains_key(&v) {
+            return false;
+        }
+        if let Some(Val::I32(x)) = self.vals.get(&v)
+            && self.s.m.int_k(*x).is_some()
+        {
+            return true;
+        }
+        for b in &self.x.p.blocks {
+            for i in &b.insts {
+                if !i.writes.iter().any(|w| w.1 == v) {
+                    continue;
+                }
+                let name = i.name();
+                return name.starts_with("v_or_")
+                    || name.starts_with("v_and_")
+                    || name.starts_with("v_xor_")
+                    || name.starts_with("v_bfi_")
+                    || name.starts_with("v_bfe_")
+                    || name.starts_with("v_lshl")
+                    || name.starts_with("v_lshr")
+                    || name.starts_with("v_ashr")
+                    || name.starts_with("v_add_nc_")
+                    || name.starts_with("v_sub_nc_")
+                    || name.starts_with("v_subrev_nc_")
+                    || name.starts_with("v_add3_")
+                    || name.starts_with("v_mad_u")
+                    || name.starts_with("v_mad_i")
+                    || name.starts_with("v_mul_lo_")
+                    || name.starts_with("v_mul_hi_")
+                    || name.starts_with("v_mul_u")
+                    || name.starts_with("v_mul_i")
+                    || name.starts_with("v_cvt_u32_")
+                    || name.starts_with("v_cvt_i32_")
+                    || name.starts_with("v_cvt_u16_")
+                    || name.starts_with("v_cvt_i16_")
+                    || name.starts_with("v_cvt_pk")
+                    || name.starts_with("v_pack_")
+                    || name.starts_with("v_perm_")
+                    || name.starts_with("v_alignbit")
+                    || name.starts_with("v_alignbyte")
+                    || name.starts_with("v_mbcnt")
+                    || name.starts_with("v_bcnt")
+                    || name.starts_with("v_ffbh")
+                    || name.starts_with("v_ffbl")
+                    || name.starts_with("v_brev")
+                    || name.starts_with("v_not_")
+                    || name.starts_with("v_min_u")
+                    || name.starts_with("v_max_u")
+                    || name.starts_with("v_min_i")
+                    || name.starts_with("v_max_i")
+                    || name.starts_with("v_med3_u")
+                    || name.starts_with("v_med3_i")
+                    || name.starts_with("s_or_")
+                    || name.starts_with("s_and_")
+                    || name.starts_with("s_xor_")
+                    || name.starts_with("s_lshl")
+                    || name.starts_with("s_lshr")
+                    || name.starts_with("s_ashr")
+                    || name.starts_with("s_add_u")
+                    || name.starts_with("s_add_i")
+                    || name.starts_with("s_sub_u")
+                    || name.starts_with("s_sub_i")
+                    || name.starts_with("s_mul_")
+                    || name.starts_with("s_bfe_")
+                    || name.starts_with("s_not_");
+            }
+        }
+        false
     }
 
     /// LOCAL: with `VICTORY_NAN_SCRUB=1` (off by default), `f` or 0 where it

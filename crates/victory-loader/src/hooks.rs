@@ -88,6 +88,32 @@ const OWN_UPSCALER: Patch<'static> = Patch {
     new: &[0x0F, 0x1F, 0x00],
 };
 
+/// Series S render-target pool size in `.rdata` (`tbl[2]`, RVA `0x6186268`):
+/// retail Series S allocates 1,277 MiB (`0x4fd00000`), sized only for 720p
+/// (scale 2/3); running Series S at native 1080p (scale 1.0) or 900p overflows
+/// `tbl[2]` and hits the fatal OOM `int3` at `0x2219650`. Raising it to the
+/// Series X value of 2,199 MiB (`0x89700000`, RVA `0x61862b8`, sharing the
+/// exact same 131,072-node BSS metadata table at `0x71c28b0`) unlocks native
+/// 1080p on Series S without crashing.
+const SERIES_S_RT_POOL: Patch<'static> = Patch {
+    what: "render scale: raise Series S render-target pool (1277 -> 2199 MiB)",
+    rva: 0x6186268,
+    expect: &[0x00, 0x00, 0xD0, 0x4F, 0x00, 0x00, 0x00, 0x00],
+    new: &[0x00, 0x00, 0x70, 0x89, 0x00, 0x00, 0x00, 0x00],
+};
+
+/// Series S transient render-target heap (`0x1d488a0`): retail Series S picks
+/// `0x1290` 64-KiB pages (297 MiB) via `cmovne rsi, rax` while Series X picks
+/// `0x2c60` (710 MiB); native 1080p on Series S needs ~432 MiB and hits the
+/// `int3` assert at `0x2473e88`. NOPing the `cmovne` allocates the full 710 MiB
+/// transient pool on Series S.
+const SERIES_S_TRANSIENT_POOL: Patch<'static> = Patch {
+    what: "render scale: raise Series S transient RT pool (297 -> 710 MiB)",
+    rva: 0x1d488b6,
+    expect: &[0x48, 0x0F, 0x45, 0xF0],
+    new: &[0x0F, 0x1F, 0x40, 0x00],
+};
+
 /// Read-only float constants of this build usable as the FSR scale:
 /// value, RVA.
 const FSR_SCALES: [(f32, usize); 4] = [
@@ -181,6 +207,14 @@ pub(crate) unsafe fn resolution_levers(base: usize, hash: &blake3::Hash) -> usiz
     if let Some(text) = scale {
         match parse_scale(&text) {
             Some(scale) => {
+                // Series S's 1,277 MiB RT pool and 297 MiB transient RT pool overflow
+                // above 720p (`scale > 2/3`), hitting fatal OOM `int3` at `0x2219650`
+                // and `0x2473e88`. Raise both to Series X sizes.
+                if scale > 0.67 {
+                    // SAFETY: forwarded from this function's contract.
+                    applied += usize::from(unsafe { apply(base, &SERIES_S_RT_POOL) });
+                    applied += usize::from(unsafe { apply(base, &SERIES_S_TRANSIENT_POOL) });
+                }
                 // With the own upscaler forced, FSR is left as it is.
                 for p in render_scale_patches(base, scale, !own) {
                     let p = Patch {

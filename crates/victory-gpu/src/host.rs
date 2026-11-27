@@ -3531,6 +3531,7 @@ impl RelayBack {
             let cut: Vec<(usize, usize)> = order.iter().map(|&p| (start(pieces[p].0) + pieces[p].1, pieces[p].2)).collect();
             let jobs = land::jobs(&cut);
             let put: Vec<std::sync::atomic::AtomicU64> = self.work.iter().map(|_| Default::default()).collect();
+            let job_notes: Vec<std::sync::Mutex<land::Notes>> = (0..jobs.len()).map(|_| Default::default()).collect();
             land::each(jobs.len(), &|j| {
                 let working = std::time::Instant::now();
                 let mut notes = land::Notes::default();
@@ -3538,9 +3539,14 @@ impl RelayBack {
                     let (i, at, n) = pieces[p];
                     put[i].fetch_add(self.work[i].0.land_back(at, n, &mut notes), Ordering::Relaxed);
                 }
-                notes.flush();
+                *job_notes[j].lock().unwrap_or_else(|e| e.into_inner()) = notes;
                 land::spent(land::stat::BACK_ALL, working);
             });
+            let mut combined = land::Notes::default();
+            for slot in job_notes {
+                combined.extend(slot.into_inner().unwrap_or_else(|e| e.into_inner()));
+            }
+            combined.flush();
             land::count(land::stat::JOBS, jobs.len() as u64);
             written.extend(put.iter().map(|p| p.load(Ordering::Relaxed)));
         } else {
@@ -4773,6 +4779,7 @@ impl Host {
                 pieces.iter().map(|(shadow, lo, hi, _)| (shadow.span().0 as usize + lo, hi - lo)).collect();
             let jobs = land::jobs(&titles);
             let put = std::sync::atomic::AtomicU64::new(0);
+            let job_notes: Vec<std::sync::Mutex<land::Notes>> = (0..jobs.len()).map(|_| Default::default()).collect();
             land::each(jobs.len(), &|j| {
                 let working = std::time::Instant::now();
                 if let Some(check) = &check {
@@ -4790,9 +4797,14 @@ impl Host {
                     // for this call.
                     put.fetch_add(unsafe { run[0].0.land_card(&addressed, after, &mut notes) }, Ordering::Relaxed);
                 }
-                notes.flush();
+                *job_notes[j].lock().unwrap_or_else(|e| e.into_inner()) = notes;
                 land::spent(land::stat::CARD_ALL, working);
             });
+            let mut combined = land::Notes::default();
+            for slot in job_notes {
+                combined.extend(slot.into_inner().unwrap_or_else(|e| e.into_inner()));
+            }
+            combined.flush();
             land::count(land::stat::JOBS, jobs.len() as u64);
             written = put.into_inner();
         } else {
@@ -5459,6 +5471,8 @@ impl Host {
         let ahead = Split::begin();
         #[cfg(feature = "diagnostics")]
         SPLIT[11].fetch_add(called.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        // Overlap heap descriptor sync with card_steps and relay_wait.
+        let heaps_synced = crate::descriptor::begin_sync_heaps();
         stage.next("submit: steps given to the card");
         // Flights in the air ([`late`]): a submission that is waited for
         // settles them first, one sent ahead only if preparing it reads
@@ -5485,9 +5499,6 @@ impl Host {
         }
         #[cfg(feature = "diagnostics")]
         ahead.part(13);
-        // Descriptors the title copied into placed heaps directly, before
-        // command lists that index those slots are submitted.
-        let heaps_synced = crate::descriptor::begin_sync_heaps();
         // That list runs first, and is one of the submission's from here on.
         let with: Vec<&HostList>;
         let runs = match &own {

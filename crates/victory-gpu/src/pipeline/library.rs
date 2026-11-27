@@ -573,7 +573,10 @@ pub(crate) fn pipeline(
 /// last save and `SAVE_EVERY` has passed (or `now`).
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
-    const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
+    // `host-pipelines.bin` can be ~1 GB: avoid frequent mid-gameplay rewrites
+    // while still flushing cleanly on exit (`now == true`).
+    const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(180);
+    const MIN_ADDED_MID_RUN: u64 = 24;
     let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
@@ -596,10 +599,11 @@ pub(crate) fn save(now: bool) {
         // No store between asking the size and writing; loads go on.
         let _alone = library.saving.write().unwrap_or_else(|e| e.into_inner());
         let added = library.added.load(Ordering::Relaxed);
-        if !USED_CHANGED.swap(false, Ordering::Relaxed) && added == 0 {
+        let write_library = added > 0 && (now || added >= MIN_ADDED_MID_RUN);
+        if !USED_CHANGED.swap(false, Ordering::Relaxed) && !write_library {
             return;
         }
-        if added == 0 {
+        if !write_library {
             0
         } else {
             // SAFETY: a plain query.

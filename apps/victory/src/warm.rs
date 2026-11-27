@@ -28,6 +28,7 @@ fn folder() -> Result<PathBuf> {
 
 pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, these: Option<String>) -> Result<()> {
     let dir = folder()?;
+    std::fs::create_dir_all(&dir)?;
     if let Some(these) = these {
         return make(&dir, &these);
     }
@@ -36,7 +37,8 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
     let fingerprint = known::fingerprint();
     let done_file = dir.join("warm-done.txt");
     let bad_file = dir.join("warm-bad.txt");
-    let keys = known::keys(&dir);
+    let entries = known::entries(&dir);
+    let skip = known::skip_hashes(&std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default());
     let listed = std::fs::read_to_string(&done_file).unwrap_or_default();
     let mut done: HashSet<&str> = HashSet::new();
     for line in listed.lines() {
@@ -50,24 +52,41 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
     let bad: HashSet<&str> = bad.lines().filter_map(|l| l.split(' ').next()).collect();
     let early = std::fs::read_to_string(dir.join("early-pipelines.txt")).unwrap_or_default();
     let early: HashSet<&str> = early.lines().collect();
+    let mut skipped = 0usize;
     // Those earlier runs drew with first, the others in no order (by key).
-    let mut all: Vec<usize> = (0..keys.len())
+    let mut all: Vec<usize> = (0..entries.len())
         .filter(|&n| {
-            let key = keys[n].as_str();
+            let (key, hashes) = &entries[n];
+            if !skip.is_empty() && hashes.iter().any(|h| skip.contains(h)) {
+                skipped += 1;
+                return false;
+            }
+            let key = key.as_str();
             (again || !done.contains(key)) && !bad.contains(key) && (!used || early.contains(key))
         })
         .collect();
-    all.sort_by_key(|&n| (!early.contains(keys[n].as_str()), &keys[n]));
+    all.sort_by_key(|&n| (!early.contains(entries[n].0.as_str()), &entries[n].0));
     all.truncate(limit.unwrap_or(usize::MAX));
     let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
     let jobs = jobs.unwrap_or(cores * 2 / 3).max(1);
+    let skipped_note = if skipped > 0 { format!(", {skipped} skipped") } else { String::new() };
     println!(
-        "{} pipelines known, {} made before ({fingerprint}), {} bad; {} to make, {jobs} processes",
-        keys.len(),
+        "{} pipelines known, {} made before ({fingerprint}), {} bad{skipped_note}; {} to make, {jobs} processes",
+        entries.len(),
         done.len(),
         bad.len(),
         all.len()
     );
+    if entries.is_empty() {
+        println!(
+            "no known pipelines in {}: run the title once with VICTORY_PIPELINE_BOOK=1 (e.g. scripts\\play-S-1080p.ps1 or scripts\\play-nvidia.ps1), then run scripts\\warm-nvidia.ps1",
+            dir.join("known-pipelines.bin").display()
+        );
+        return Ok(());
+    }
+    if all.is_empty() {
+        return Ok(());
+    }
     let chunks: Vec<&[usize]> = all.chunks(AT_ONCE).collect();
     let next = AtomicUsize::new(0);
     let state = Mutex::new((Vec::<f64>::new(), 0usize, 0usize));
@@ -83,7 +102,7 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
                     while !rest.is_empty() {
                         let (made, ended) = child(rest, |n, ms, there| {
                             if ms >= SLOW_MS {
-                                let _ = writeln!(lock(&slow_out), "\n{} {ms:.0}", keys[n]);
+                                let _ = writeln!(lock(&slow_out), "\n{} {ms:.0}", entries[n].0);
                             }
                             let mut state = lock(&state);
                             state.0.push(ms);
@@ -93,14 +112,14 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
                                 println!("{count} of {}, {:.0} s", all.len(), began.elapsed().as_secs_f64());
                             }
                             drop(state);
-                            let _ = writeln!(lock(&done_out), "{fingerprint} {}", keys[n]);
+                            let _ = writeln!(lock(&done_out), "{fingerprint} {}", entries[n].0);
                         });
                         rest = &rest[made.min(rest.len())..];
                         match (ended, rest.split_first()) {
                             (Some(why), Some((&n, after))) => {
                                 // The one it was at.
-                                println!("pipeline {n} {}: {why}", keys[n]);
-                                let _ = writeln!(lock(&bad_out), "{} {why}", keys[n]);
+                                println!("pipeline {n} {}: {why}", entries[n].0);
+                                let _ = writeln!(lock(&bad_out), "{} {why}", entries[n].0);
                                 lock(&state).2 += 1;
                                 rest = after;
                             }
@@ -122,7 +141,7 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
         at(0.9),
         at(0.99),
         times.last().copied().unwrap_or(0.0),
-        times.iter().sum::<f64>() / 1e3
+        times.iter().fold(0.0_f64, |a, &b| a + b) / 1e3
     );
     Ok(())
 }

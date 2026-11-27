@@ -516,6 +516,13 @@ fn taken() -> bool {
 static TAKEN: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 impl Notes {
+    /// Appends another job's notes so one landing flushes once instead of per job.
+    pub(crate) fn extend(&mut self, other: Notes) {
+        self.pages.extend(other.pages);
+        self.spans.extend(other.spans);
+        self.landed.extend(other.landed);
+    }
+
     /// At the end of a job: what it wrote beside the guards is noted.
     pub(crate) fn flush(&mut self) {
         if self.pages.is_empty() {

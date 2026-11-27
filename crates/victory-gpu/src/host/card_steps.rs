@@ -534,16 +534,37 @@ enum To {
 /// Records a level of what [`stage`] describes into `list` (open): `reads`
 /// are copied into `between` (source, offset in it, offset in `between`,
 /// bytes), then `writes` out of it (destination, offset in it, offset in
-/// `between`, bytes). `between` is left readable as constants (and must be
-/// so, unless this is the `first` level), the others in the common state,
-/// as the submission's lists expect them.
+/// `between`, bytes). `between` is left readable as constants once used
+/// (`between_used` returned true), the others in the common state, as the
+/// submission's lists expect them.
 fn record(
     first: bool,
+    between_used: bool,
     list: &ID3D12GraphicsCommandList,
     between: &ID3D12Resource,
     reads: &[(&ID3D12Resource, u64, u64, u64)],
     writes: &[(&ID3D12Resource, u64, u64, u64)],
-) {
+) -> bool {
+    // SAFETY: an open list; live buffers, and the callers' ranges lie in
+    // them. The buffers start in the common state (the list is the first of
+    // its call) and are promoted by their first use.
+    unsafe {
+        if first {
+            // What earlier lists' shaders wrote, first.
+            list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                    UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                        pResource: std::mem::ManuallyDrop::new(None),
+                    }),
+                },
+            }]);
+        }
+        if reads.is_empty() && writes.is_empty() {
+            return between_used;
+        }
+    }
     let common = D3D12_RESOURCE_STATE_COMMON;
     let (source, dest) = (D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
     let mut sources: Vec<&ID3D12Resource> = Vec::new();
@@ -560,22 +581,9 @@ fn record(
     let mut barriers = vec![transition(between, dest, constants)];
     barriers.extend(sources.iter().map(|b| transition(b, source, if both(b) { dest } else { common })));
     let done: Vec<D3D12_RESOURCE_BARRIER> = dests.iter().map(|b| transition(b, dest, common)).collect();
-    // SAFETY: an open list; live buffers, and the callers' ranges lie in
-    // them. The buffers start in the common state (the list is the first of
-    // its call) and are promoted by their first use.
+    // SAFETY: as above.
     unsafe {
-        if first {
-            // What earlier lists' shaders wrote, first.
-            list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
-                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
-                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-                Anonymous: D3D12_RESOURCE_BARRIER_0 {
-                    UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
-                        pResource: std::mem::ManuallyDrop::new(None),
-                    }),
-                },
-            }]);
-        } else {
+        if between_used {
             list.ResourceBarrier(&[transition(between, constants, dest)]);
         }
         for &(buffer, offset, at, len) in reads {
@@ -589,6 +597,7 @@ fn record(
             list.ResourceBarrier(&done);
         }
     }
+    true
 }
 
 /// The list in front of a submission's, and its buffer ([`BETWEEN`] bytes).
@@ -806,6 +815,7 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         own.list.note_op(|| format!("{} copies of title memory done on the card, {end} bytes (VICTORY_CARD_STEPS)", ops.len()));
         let levels = ops.iter().map(|op| op.level).max().unwrap_or(0);
+        let mut between_used = false;
         for level in 0..=levels {
             let mut reads = Vec::new();
             let mut writes = Vec::new();
@@ -822,7 +832,7 @@ impl Host {
                     To::Slot(..) => {}
                 }
             }
-            record(level == 0, &own.list.list, &own.between, &reads, &writes);
+            between_used = record(level == 0, between_used, &own.list.list, &own.between, &reads, &writes);
         }
         own.list.close();
         // SAFETY: a live buffer.
@@ -832,15 +842,15 @@ impl Host {
         // several threads, a slot always on the same one, in the steps'
         // order.)
         let parts = if ops.len() < 256 { 1 } else { 8 };
-        crate::land::each_under(parts, &|part| {
-            for op in &ops {
-                if let To::Slot(heap, index) = &op.to
-                    && *index as usize / 4 % parts == part
-                {
-                    // (A heap that is gone: nothing can read the slot.)
-                    crate::descriptor::constant_slot(*heap, *index, &own.between, gpu + op.at, op.len as u32);
-                }
+        let mut buckets: Vec<Vec<(usize, u32, u64, u32, &ID3D12Resource)>> = (0..parts).map(|_| Vec::new()).collect();
+        for op in &ops {
+            if let To::Slot(heap, index) = &op.to {
+                let b = *index as usize / 4 % parts;
+                buckets[b].push((*heap, *index, gpu + op.at, op.len as u32, &own.between));
             }
+        }
+        crate::land::each_under(parts, &|part| {
+            crate::descriptor::constant_slots(&buckets[part]);
         });
         let copies = ops.iter().filter(|op| matches!(op.to, To::Copy(..))).count();
         DONE[0].fetch_add((ops.len() - copies) as u64, Ordering::Relaxed);
@@ -1165,15 +1175,16 @@ mod tests {
         let was = a_bytes.to_vec();
         let own = host.own_list().unwrap();
         // Within `a` (there and back), from `a` to `b`, and a read alone.
-        record(
+        let used = record(
             true,
+            false,
             &own.list.list,
             &own.between,
             &[(&a, 33, 0, 100), (&a, 2000, 256, 100), (&a, 5001, 512, 7), (&a, 9, 1024, 4)],
             &[(&a, 2000, 0, 100), (&a, 33, 256, 100), (&b, 77, 512, 7)],
         );
         // A level behind it, of what it wrote.
-        record(false, &own.list.list, &own.between, &[(&b, 77, 2048, 7)], &[(&b, 1077, 2048, 7)]);
+        record(false, used, &own.list.list, &own.between, &[(&b, 77, 2048, 7)], &[(&b, 1077, 2048, 7)]);
         own.list.close();
         // A list behind it that uses the buffers in other ways.
         let next = host.new_list().unwrap();

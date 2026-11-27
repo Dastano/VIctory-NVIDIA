@@ -1346,7 +1346,6 @@ impl State {
 
     /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches.
     fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
-        #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return false;
         }
@@ -1411,13 +1410,6 @@ impl State {
             crate::list::ensure_state(list, t as This, RENDER_TARGET);
         }
         if self.depth != 0 {
-            // A depth texture shaders also write: what they wrote, first.
-            list.twin_use(self.depth as This, false, true);
-            // A view that writes neither plane keeps the texture readable:
-            // the depth read state, together with the shader read states
-            // if this draw's shaders read the same texture (the write state
-            // put it out of the state those views need, and a move to it
-            // and back for every such draw).
             let state = if self.depth_state == DEPTH_READ {
                 let (tested, read) = TESTED_DEPTH.get();
                 if read && tested == self.depth {
@@ -1428,6 +1420,8 @@ impl State {
             } else {
                 DEPTH_WRITE
             };
+            // A depth texture shaders also write: what they wrote, first.
+            list.twin_use(self.depth as This, false, true);
             crate::list::ensure_state(list, self.depth as This, state);
         }
         true
@@ -2638,9 +2632,9 @@ impl State {
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: u32) {
         // It may write the arguments a window holds clamped.
         self.window = None;
-        #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
             return;
         }
@@ -3249,6 +3243,43 @@ impl State {
                 fresh.push(u.slot);
             }
         }
+        for &(slot, at) in half {
+            if fresh.contains(&slot) {
+                continue;
+            }
+            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
+                continue;
+            };
+            let end = table + u64::from(at) * 4;
+            if let Some(heap) = self.heap_of(table)
+                && let (Some(host), Some(index)) = (heap.host(), heap.index(end))
+                && index >= host.count()
+            {
+                fresh.push(slot);
+            }
+        }
+        for idx in indexed {
+            if fresh.contains(&idx.table_slot) {
+                continue;
+            }
+            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(idx.table_slot)) else {
+                continue;
+            };
+            let constant = self.user_value(
+                compute,
+                idx.constant_slot,
+                RootType::Constants,
+                idx.constant_dword,
+            );
+            let k = idx.byte_offset.wrapping_add(constant << idx.shift) / 32;
+            let end = table + u64::from(k) * 32;
+            if let Some(heap) = self.heap_of(table)
+                && let (Some(host), Some(index)) = (heap.host(), heap.index(end))
+                && index >= host.count()
+            {
+                fresh.push(idx.table_slot);
+            }
+        }
         fresh.sort_unstable();
         for u in used.iter().filter(tables) {
             if !fresh.contains(&u.slot) {
@@ -3275,31 +3306,31 @@ impl State {
             let Some(host) = heap.host() else {
                 continue;
             };
-            let mut selected: Vec<u32> = indexed
-                .iter()
-                .filter(|index| index.table_slot == slot)
-                .map(|index| {
-                    let constant = self.user_value(
-                        compute,
-                        index.constant_slot,
-                        RootType::Constants,
-                        index.constant_dword,
-                    );
-                    // The shader adds i32 byte offsets and shifts by 5.
-                    index.byte_offset.wrapping_add(constant << index.shift) / 32
-                })
-                .collect();
+            let mut selected: Few<u32, 16> = Few::default();
+            for index in indexed.iter().filter(|index| index.table_slot == slot) {
+                let constant = self.user_value(
+                    compute,
+                    index.constant_slot,
+                    RootType::Constants,
+                    index.constant_dword,
+                );
+                // The shader adds i32 byte offsets and shifts by 5.
+                let k = index.byte_offset.wrapping_add(constant << index.shift) / 32;
+                if !selected.contains(&k) {
+                    selected.push(k);
+                }
+            }
             // The descriptors the shader moves halves through are made too,
             // and the table reaches them: they may lie past the range starts
             // the entries give (a range of several views names only its
             // first; review on #927).
-            selected.extend(
-                half.iter()
-                    .filter(|&&(s, _)| s == slot)
-                    .map(|&(_, at)| at / 8),
-            );
+            for &(_, at) in half.iter().filter(|&&(s, _)| s == slot) {
+                let k = at / 8;
+                if !selected.contains(&k) {
+                    selected.push(k);
+                }
+            }
             selected.sort_unstable();
-            selected.dedup();
             let n = entries()
                 .map(|u| u.table_offset_dwords / 8)
                 .chain(selected.last().copied())
@@ -3307,7 +3338,7 @@ impl State {
                 .unwrap_or(0)
                 + 1;
             let last = table.checked_add(u64::from(n - 1) * 32);
-            if n > crate::descriptor::host::DYNAMIC
+            if n > host.dynamic_count()
                 || last.and_then(|handle| heap.index(handle)).is_none()
             {
                 once!(slot, n, "fresh descriptor table exceeds the available span");
@@ -3353,7 +3384,7 @@ impl State {
                         readable(list, u.kind, &view);
                     }
                 }
-                for k in selected {
+                for &k in selected.iter() {
                     if entries().any(|u| u.table_offset_dwords / 8 == k) {
                         continue;
                     }
@@ -3413,7 +3444,11 @@ impl State {
                 let index = first + k;
                 // A view this list has made before: its descriptor copied,
                 // and nothing more if nothing changed in the list since.
+                // Skip the cached path for `half_views` slots so `halved()`
+                // rewrites R16*_FLOAT/_SINT views to R16*_UINT for the face
+                // deformation network instead of copying the raw title view.
                 if list_views
+                    && !half.contains(&(slot, k * 8))
                     && let Some(words) = crate::descriptor::record_at(table + u64::from(k) * 32)
                     && let Some(mut listed) = host.make_listed(recording, words, index)
                 {
@@ -3794,8 +3829,8 @@ impl State {
         count: Option<u64>,
     ) -> bool {
         // Skip before the argument clamp can mutate the indirect buffer.
-        #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
+            #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
             return false;
         }
@@ -3810,7 +3845,12 @@ impl State {
         let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
         #[cfg(not(feature = "diagnostics"))]
         let why = |_: &str| {};
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let p = if kind == DISPATCH {
+            crate::pipeline::host_pipeline(self.pipeline as This)
+        } else {
+            crate::pipeline::host_pipeline_for(self.pipeline as This, &self.target_formats)
+        };
+        let Some(p) = p else {
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
             return false;
