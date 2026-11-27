@@ -101,6 +101,8 @@ $settings = @{
     VICTORY_RELAY2_BURY_ASIDE = '0'; VICTORY_RELAY2_TELL_FIRST = '0'
     # Fewer refreshes past copies off: boat drive r103 (on) 32.6 fps / 36 dips, r104 (off) 33.9 / 30
     VICTORY_FEWER_PAST_COPIES = '0'
+    # Sorted card-step runs off: boat drive r106 (on) 32.0 fps / 45 dips, r105 (before) 35.4 / 21
+    VICTORY_CARD_RUNS_SORTED = '0'
     # Descriptor heaps' records
     VICTORY_HEAP_SYNC_FIRST = '1'; VICTORY_SYNC_IN_PLACE = '1'; VICTORY_SPANS_QUICK = '1'; VICTORY_SYNC_FINE = '1'
     VICTORY_HEAP_SYNC_AT_SUBMIT = '1'

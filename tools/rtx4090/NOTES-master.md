@@ -297,3 +297,5 @@ Ported from readmet3xt-lab/foxhound 0.2.0-pre.4 (3d52ac8; it also carries our PR
 copy let go is marked unused (long-session slowdown, their #12), a pool of list preludes (VICTORY_PRELUDE_POOL),
 the card with the most dedicated memory (or VICTORY_ADAPTER). r105 (boat drive, DLSS Quality, no cap): 35.4 fps
 mean, 21 of 99 lines under 29.5 (10 under 27), over 50 ms 539, longest 320 ms - the best boat run so far.
+
+r106 (boat drive; `VICTORY_CARD_RUNS_SORTED`: card-step places sorted by host copy and address, read in runs): 1,502 places in 1,322 copies (few runs); 32.0 fps, 45 of 99 lines under 29.5 (r105: 35.4 / 21): off in the launcher.
