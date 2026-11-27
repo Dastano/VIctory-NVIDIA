@@ -176,3 +176,7 @@ over 50 ms 363, longest 143 ms: no change from r74 (29.30). The submitting threa
 average; the frames over 40 ms are no longer explained by it alone: the card's clock line puts much of the idle
 time "while the title had not submitted", i.e. the title's own threads (its code plus our write guards' faults,
 ~350 a frame) set those frames. Next lever, if any: the title threads' fault cost, not the submitting thread.
+
+r76 (`VICTORY_COPY_BESIDE=1`, `VICTORY_STORE_BESIDE=1`: the title's writes into guarded blocks done beside the
+guards): 29.42 fps (r75: 29.34), preparing 18.1 ms, over 50 ms 355: within noise; left off (they emulate the
+title's stores, a fault there would corrupt title data for ~0.1 fps).
