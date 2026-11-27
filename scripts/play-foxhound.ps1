@@ -84,6 +84,8 @@ $settings = @{
     VICTORY_PORT_GUARD = '1'
     # Refresh helpers kept awake through a submission (RTX 4090 r70: longest frame 145 ms walking, r68: 525 ms)
     VICTORY_PASSES_HOT = '1'
+    # A frame's texture pass runs at most 8 ms in all; the rest waits a frame (RTX 4090 r84: 47.0 fps walking uncapped, r82: 39.4)
+    VICTORY_TEXSPK_PASS_MS = '8'
     # Descriptor heaps' records
     VICTORY_HEAP_SYNC_FIRST = '1'; VICTORY_SYNC_IN_PLACE = '1'; VICTORY_SPANS_QUICK = '1'; VICTORY_SYNC_FINE = '1'
     VICTORY_HEAP_SYNC_AT_SUBMIT = '1'

@@ -205,3 +205,12 @@ DLSS Quality, no cap.
 r83 (walking, DLSS Balanced, no cap): 40.35 fps mean, 12 of 115 lines under 29.5 (7 under 27): little better
 than Quality (r82: 39.4, 14): the remaining dips are not the card's; they are spikes of the title's and our CPU
 work at heavy moments of the mission. Recommended: DLSS Quality, no cap (or -Fps 30 for even frame times).
+
+## Texture pass budget (r84-r85)
+
+A log analysis of r82 tied the frames over 50 ms to bursts of first-fill texture uploads (~3,000 a second; the
+texture pass ran 2.2-2.7 s of every 5 s in those stretches). `VICTORY_TEXSPK_PASS_MS=8` (perf/texspikes) caps a
+frame's texture pass at 8 ms, the rest a frame later. r84 (walking, DLSS Quality, no cap, window on the 4090's
+display): 47.0 fps mean (r82, the same without the cap: 39.4), 14 lines under 29.5, 5 under 27. r85 (the same on
+the Parsec primary display, shots every 7 s): 39.7 fps; textures sharp, water lit, no faults in the shots. On in
+the launcher. The Parsec virtual display costs ~7 fps uncapped.
