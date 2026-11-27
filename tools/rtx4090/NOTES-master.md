@@ -279,3 +279,14 @@ r99 (boat drive; `VICTORY_RELAY_TEX_WIDE`: a flight's texture read-backs land on
 overlapping ones in order; perf/relay, on): 33.8 fps mean (r97/r98: 32.9), 35 of 98 lines under 29.5 (r97/r98:
 42-48), 21 under 27 (24-29), lowest line 19.2 (6.8-7.7). The relay's texture read-backs: 14.0 a frame, all 14 at
 once, 0.74 ms of "read-backs and lists" (about 4.5 ms before in slow seconds).
+
+## trustno1 merge 0cef07e..f3534e6, relay round 2 off (r100-r102)
+
+r100 (relay round 2 on: retired objects released on their own thread, the title told before flights are tidied)
+32.4 fps / 44 of 99 lines under 29.5; r101 (same build, both off) 33.5 / 37: off in the launcher.
+Merged trustno1-coder/VIctory-NVIDIA up to f3534e6 (placed views ignore padding words - the memory and slowdown
+over a session, "confetti on faces"; upload room reserved at start - crash on 4090; arena storm; audio DSP
+convolutions; FSR 3 frame generation; MFG unlocker opt-in; VICTORY_HOME). r102 (boat drive, DLSS Quality, no cap):
+35.3 fps mean, 23 of 97 lines under 29.5 (10 under 27), over 50 ms 374, longest 191 ms - the best boat run so
+far (r96-r101: 32.3-33.8 fps, 35-48 lines under 29.5). Picture clean: faces whole, water lit, no black boxes.
+PR readmet3xt-lab/foxhound#13 was closed without merge or comment.
