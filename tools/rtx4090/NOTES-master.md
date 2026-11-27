@@ -290,3 +290,10 @@ convolutions; FSR 3 frame generation; MFG unlocker opt-in; VICTORY_HOME). r102 (
 35.3 fps mean, 23 of 97 lines under 29.5 (10 under 27), over 50 ms 374, longest 191 ms - the best boat run so
 far (r96-r101: 32.3-33.8 fps, 35-48 lines under 29.5). Picture clean: faces whole, water lit, no black boxes.
 PR readmet3xt-lab/foxhound#13 was closed without merge or comment.
+
+r103/r104 (boat drive; `VICTORY_FEWER_PAST_COPIES`: refreshes after a copy into title memory skipped when the
+journal shows nothing new): on 32.6 fps / 36 lines under 29.5, off 33.9 / 30: off in the launcher.
+Ported from readmet3xt-lab/foxhound 0.2.0-pre.4 (3d52ac8; it also carries our PR #13's two switches): a texture
+copy let go is marked unused (long-session slowdown, their #12), a pool of list preludes (VICTORY_PRELUDE_POOL),
+the card with the most dedicated memory (or VICTORY_ADAPTER). r105 (boat drive, DLSS Quality, no cap): 35.4 fps
+mean, 21 of 99 lines under 29.5 (10 under 27), over 50 ms 539, longest 320 ms - the best boat run so far.
