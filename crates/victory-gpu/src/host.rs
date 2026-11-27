@@ -8621,6 +8621,21 @@ fn wide_textures() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_TEXTURES").is_none_or(|v| v != "0") && wide_refresh())
 }
 
+/// With `crate::watch::refresh_skip`: refreshes of ranges up to this many
+/// bytes (64 pages) are looked at on the submitting thread, before a flush asks
+/// anything or wakes a thread; a look walks the range's pages, and longer
+/// ones stay with the threads beside it (renderer port #6's planning).
+const SKIP_SHORT: usize = 64 * crate::watch::PAGE;
+
+/// Of `refreshes`, those of short ranges ([`SKIP_SHORT`]) that are known to
+/// copy nothing (`Shadow::nothing_new`) are left out, on this thread; how
+/// many.
+fn skip_known(refreshes: &mut Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>) -> usize {
+    let all = refreshes.len();
+    refreshes.retain(|(shadow, from, to)| *to - *from > SKIP_SHORT || !shadow.nothing_new(*from, *to - *from));
+    all - refreshes.len()
+}
+
 impl Batch {
     /// This thread's last one, emptied ([`SPARE_BATCH`]), or a new one.
     fn reused() -> Batch {
@@ -8869,6 +8884,10 @@ impl Batch {
             let all = spans.len();
             spans.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
             FLUSHES[2].fetch_add((all - spans.len()) as u64, Ordering::Relaxed);
+        } else if crate::watch::light() && crate::watch::refresh_skip() {
+            // The short ones here: no thread is woken for them, nor for
+            // none (`crate::watch::refresh_skip`).
+            FLUSHES[2].fetch_add(skip_known(&mut spans) as u64, Ordering::Relaxed);
         }
         let ahead = spans.len() > 1;
         if ahead {
@@ -9015,6 +9034,12 @@ impl Batch {
             self.refreshes.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
             FLUSHES[2].fetch_add((all - self.refreshes.len()) as u64, Ordering::Relaxed);
+        } else if light && crate::watch::refresh_skip() {
+            // The short ones here, before anything is asked: a flush left
+            // with none or few wakes no thread (`crate::watch::refresh_skip`).
+            let started = std::time::Instant::now();
+            FLUSHES[2].fetch_add(skip_known(&mut self.refreshes) as u64, Ordering::Relaxed);
+            PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
         // One write-watch asking for the copies that lie close together,
         // not one per copy.
@@ -11167,6 +11192,16 @@ mod refresh_tests {
         }
     }
 
+    /// The same with renderer port #6's planning beside (as the RTX 4090
+    /// runs have it), where `VICTORY_REFRESH_SKIP` tells the refreshes that
+    /// copy nothing so on the submitting thread before a flush asks anything.
+    #[test]
+    fn refreshed_ranges_hold_title_memory_with_the_planning_beside() {
+        crate::watch::PORT_GUARD_IN_TEST.set(true);
+        refreshed_ranges_hold_title_memory();
+        crate::watch::PORT_GUARD_IN_TEST.set(false);
+    }
+
     /// A copy in the card's memory, with the card's side and the sends to it
     /// played by the test.
     struct Carded {
@@ -11645,6 +11680,94 @@ mod refresh_tests {
         );
         #[cfg(feature = "diagnostics")]
         println!("per frame, as `crate::watch::asks`: {:?}", crate::watch::asks().map(|n| n / FRAMES as u64));
+    }
+
+    /// Where a flush of refreshes that all copy nothing spends its time: 40
+    /// flushes of ~110 copies each (of 4,400 and a big one), all taken
+    /// already, with renderer port #6's planning beside (as the RTX 4090 runs
+    /// have it) and without. Run with `--ignored --nocapture noop_flushes`.
+    #[test]
+    #[ignore]
+    fn noop_flushes() {
+        const EACH: usize = 224 << 10;
+        const BIG: usize = 174 << 20;
+        // `VICTORY_BENCH_APART=1`: each copy in a reservation of its own, so
+        // that the submission's asking holds as many ranges.
+        let apart = std::env::var_os("VICTORY_BENCH_APART").is_some_and(|v| v == "1");
+        let watched = if apart { 0 } else { title(4400 * EACH, false) };
+        let big = title(BIG, true);
+        // SAFETY: the test's own memory.
+        unsafe {
+            if !apart {
+                std::ptr::write_bytes(watched as *mut u8, 1, 4400 * EACH);
+            }
+            std::ptr::write_bytes(big as *mut u8, 1, BIG);
+        }
+        let mut ranges: Vec<(Arc<Shadow>, usize, usize)> = (0..4400)
+            .map(|i| {
+                let at = if apart {
+                    let at = title(EACH.next_multiple_of(PAGE), false);
+                    // SAFETY: the test's own memory.
+                    unsafe { std::ptr::write_bytes(at as *mut u8, 1, EACH) };
+                    at
+                } else {
+                    watched + i * EACH
+                };
+                (Shadow::unbacked(at as u64, memory(EACH), EACH as u64, false), at + 4000, EACH - 9000)
+            })
+            .collect();
+        let heap = Shadow::unbacked(big as u64, memory(BIG), BIG as u64, true);
+        for k in 0..40 {
+            ranges.push((heap.clone(), big + k * 4 * PAGE + 100, 3 * PAGE));
+        }
+        let asked: Vec<(usize, usize)> = ranges.iter().map(|r| (r.1, r.1 + r.2)).collect();
+        // Everything taken once.
+        crate::watch::ask_once(&asked);
+        for (shadow, at, len) in &ranges {
+            shadow.update(*at, *len);
+        }
+        crate::watch::ask_once_end();
+        heap.take_dirty();
+        for skip in [false, true] {
+        for beside in [true, false] {
+            crate::watch::PORT_GUARD_IN_TEST.set(beside);
+            crate::watch::SKIP_IN_TEST.store(if skip { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+            let mut best = f64::MAX;
+            for _ in 0..8 {
+                crate::watch::ask_once(&asked);
+                let mut batch = Batch::default();
+                let started = std::time::Instant::now();
+                for part in ranges.chunks(ranges.len() / 40) {
+                    for (shadow, at, len) in part {
+                        batch.add(shadow, *at, *len);
+                    }
+                    batch.flush();
+                }
+                best = best.min(started.elapsed().as_secs_f64() * 1e3);
+                crate::watch::ask_once_end();
+            }
+            // The parts: the asking, the looks alone, and the threads woken
+            // for nothing.
+            let started = std::time::Instant::now();
+            crate::watch::ask_once(&asked);
+            let asking = started.elapsed().as_secs_f64() * 1e3;
+            let started = std::time::Instant::now();
+            let known = ranges.iter().filter(|(s, at, len)| s.nothing_new(*at, *len)).count();
+            let looks = started.elapsed().as_secs_f64() * 1e3;
+            crate::watch::ask_once_end();
+            let started = std::time::Instant::now();
+            for _ in 0..40 {
+                crate::shadow::wide_each(110, |_| {});
+            }
+            let woken = started.elapsed().as_secs_f64() * 1e3;
+            println!(
+                "skip {skip}, beside {beside}: 40 flushes of {} refreshes, all known to copy nothing ({known}): best {best:.3} ms;                  the asking {asking:.3} ms, the looks alone on one thread {looks:.3} ms; 40 wakings for nothing {woken:.3} ms",
+                ranges.len()
+            );
+        }
+        }
+        crate::watch::PORT_GUARD_IN_TEST.set(false);
+        crate::watch::SKIP_IN_TEST.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 }
 

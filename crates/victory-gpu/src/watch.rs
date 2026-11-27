@@ -118,6 +118,127 @@ pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
     })
 }
 
+/// Whether a submission's refreshes that copy nothing are told so cheaply
+/// (`VICTORY_REFRESH_SKIP=0`: as before; on by default, as nothing it
+/// decides differs):
+/// - whether a range lies in one the submission's asking holds ([`Ahead`]) is
+///   found by a binary search, not by a walk over all of them;
+/// - a flush's refreshes of short ranges that copy nothing are told so on the
+///   submitting thread before anything is asked and any thread woken
+///   (`crate::host`), as without renderer port #6's planning beside
+///   ([`port_guard_plan`]); a flush left with none, or few, wakes no thread.
+///
+/// What it was (RTX 4090 runs r46-r48, walking through the crowded common
+/// room): 7-10 ms a frame of the submitting thread in 40-50 flushes of
+/// 7,000-11,000 refreshes, 90 % of them copying nothing. Each look at one of
+/// those (`Shadow::nothing_new`) walked the submission's asked ranges, one
+/// for every copy that lies alone ([`ask_rest`]), as did every [`writes`] of
+/// the others and [`ask_rest`] itself for each range (thousands squared); and
+/// every flush woke the threads beside it even when all of its refreshes
+/// copied nothing.
+///
+/// The answers are the same: the binary search finds a range that holds the
+/// one asked about exactly when the walk did, and a refresh told it copies
+/// nothing on the submitting thread is told so by the same look
+/// (`Shadow::nothing_new`) that the threads beside made, a moment earlier;
+/// that look answers yes only from what is known for sure then (the bits of
+/// guarded blocks, or the submission's one asking, which stands until a step
+/// writes title memory), as with `VICTORY_PORT_GUARD_PLAN=0`.
+pub(crate) fn refresh_skip() -> bool {
+    #[cfg(test)]
+    match SKIP_IN_TEST.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    // Read here: the cheap telling of refreshes that copy nothing.
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_SKIP").is_none_or(|v| v != "0"))
+}
+
+/// [`refresh_skip`] in tests: 0 as the environment says, 1 off, 2 on (for
+/// all threads: both ways answer the same).
+#[cfg(test)]
+pub(crate) static SKIP_IN_TEST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// The page ranges a submission's asking holds ([`Journal::ahead`]), and,
+/// with [`refresh_skip`], the same sorted by their first page, each with the
+/// furthest end of it and all before it: one of them holds `[first, last)`
+/// if the furthest end of those that begin at or before `first` is `last` or
+/// further.
+struct Ahead {
+    ranges: Vec<(usize, usize)>,
+    sorted: Vec<(usize, usize)>,
+}
+
+impl Ahead {
+    const fn new() -> Ahead {
+        Ahead { ranges: Vec::new(), sorted: Vec::new() }
+    }
+
+    fn set(&mut self, ranges: Vec<(usize, usize)>) {
+        self.ranges = ranges;
+        self.sorted.clear();
+        if refresh_skip() {
+            self.sorted.extend_from_slice(&self.ranges);
+            self.sorted.sort_unstable();
+            let mut furthest = 0;
+            for range in &mut self.sorted {
+                furthest = furthest.max(range.1);
+                range.1 = furthest;
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.ranges.clear();
+        self.sorted.clear();
+    }
+
+    fn take(&mut self) -> Vec<(usize, usize)> {
+        self.sorted.clear();
+        std::mem::take(&mut self.ranges)
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.ranges.is_empty()
+    }
+
+    /// Whether one of the ranges holds the pages `[first, last)`.
+    fn holds(&self, first: usize, last: usize) -> bool {
+        if self.sorted.len() != self.ranges.len() {
+            return self.ranges.iter().any(|&(a, b)| a <= first && last <= b);
+        }
+        let before = self.sorted.partition_point(|&(a, _)| a <= first);
+        before > 0 && last <= self.sorted[before - 1].1
+    }
+}
+
+/// With [`refresh_skip`]: the ranges [`ask_rest`] adds to the asking's, by
+/// their first page (the furthest end of those that begin there), and the
+/// longest.
+#[derive(Default)]
+struct Added {
+    by_first: BTreeMap<usize, usize>,
+    longest: usize,
+}
+
+impl Added {
+    fn add(&mut self, first: usize, last: usize) {
+        let end = self.by_first.entry(first).or_insert(last);
+        *end = (*end).max(last);
+        self.longest = self.longest.max(last - first);
+    }
+
+    /// Whether one of them holds `[first, last)`: one that does begins at or
+    /// before `first`, and no further before `last` than the longest is long.
+    fn holds(&self, first: usize, last: usize) -> bool {
+        let from = last.saturating_sub(self.longest);
+        from <= first && self.by_first.range(from..=first).any(|(_, &b)| last <= b)
+    }
+}
+
 struct Journal {
     /// Page number → the asking that last found it written.
     written: BTreeMap<usize, u64>,
@@ -128,7 +249,7 @@ struct Journal {
     /// Page ranges asked ahead for a submission's refreshes ([`ask_ahead`])
     /// and the asking that did: `writes` answers for a range inside one
     /// from the journal, without another kernel call.
-    ahead: Vec<(usize, usize)>,
+    ahead: Ahead,
     ahead_asked: u64,
     /// The ahead asking stands for a whole submission ([`ask_once`]): no
     /// other ahead asking is made, and `ahead` stays, until
@@ -145,7 +266,7 @@ struct Journal {
 static JOURNAL: RwLock<Journal> = RwLock::new(Journal {
     written: BTreeMap::new(),
     parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
-    ahead: Vec::new(),
+    ahead: Ahead::new(),
     ahead_asked: 0,
     kept: false,
 });
@@ -326,6 +447,11 @@ const AHEAD_MAX: usize = (1 << 30) / PAGE;
 /// 456 ms, in run 14). Ranges that are not write-watched, or lie alone, are
 /// left to `writes`.
 pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
+    // The submission's one asking stands (below): with [`refresh_skip`] that
+    // is seen before the pieces are gathered and sorted, at every flush.
+    if refresh_skip() && journal().kept {
+        return;
+    }
     let mut pieces: Vec<(usize, usize)> = ranges
         .iter()
         // Not view memory known by its bits: the kernel would refuse the
@@ -362,7 +488,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     note_hot(&written);
     let mut j = journal_mut();
     j.ahead_asked = next_asking();
-    j.ahead = asked;
+    j.ahead.set(asked);
     let now = j.ahead_asked;
     for (page, parts) in written {
         j.note(page, parts, now);
@@ -572,8 +698,12 @@ fn ask_rest(ranges: &[(usize, usize)]) {
     let _all = Asking::hold_all();
     let mut ahead = {
         let mut j = journal_mut();
-        std::mem::take(&mut j.ahead)
+        std::mem::replace(&mut j.ahead, Ahead::new())
     };
+    // (With [`refresh_skip`]: what `ask_ahead` asked is looked up in `ahead`,
+    // sorted, what is asked here in `added`.)
+    let skip = refresh_skip();
+    let mut added = Added::default();
     // `ask_ahead` leaves a range that lies alone to `writes`, which asks
     // once per flush: with one asking for the submission that was every
     // such range asked again at each of its 70 flushes (run 76: 2,300
@@ -585,11 +715,18 @@ fn ask_rest(ranges: &[(usize, usize)]) {
             continue;
         }
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-        if !ahead.iter().any(|&(a, b)| a <= first && last <= b)
-            && let Some(pages) = kernel_written(first, last)
-        {
+        let held = if skip {
+            ahead.holds(first, last) || added.holds(first, last)
+        } else {
+            ahead.ranges.iter().any(|&(a, b)| a <= first && last <= b)
+        };
+        if !held && let Some(pages) = kernel_written(first, last) {
             written.extend(pages);
-            ahead.push((first, last));
+            if skip {
+                added.add(first, last);
+            } else {
+                ahead.ranges.push((first, last));
+            }
         }
     }
     note_hot(&written);
@@ -603,8 +740,10 @@ fn ask_rest(ranges: &[(usize, usize)]) {
     for (page, parts) in written {
         j.note(page, parts, now);
     }
+    let mut ahead = ahead.take();
+    ahead.extend(added.by_first);
     j.kept = !ahead.is_empty();
-    j.ahead = ahead;
+    j.ahead.set(ahead);
 }
 
 /// The submission's one asking stands no longer: its refreshes are done,
@@ -678,8 +817,7 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let j = journal();
     j.ahead
-        .iter()
-        .any(|&(a, b)| a <= first && last <= b)
+        .holds(first, last)
         .then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
 }
 
@@ -698,7 +836,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let of = |j: &Journal| -> Vec<(usize, u64)> { j.written.range(first..last).map(|(&p, &w)| (p, w)).collect() };
     // Asked ahead with the submission's other ranges: the journal has it.
-    let ahead = |j: &Journal| j.ahead.iter().any(|&(a, b)| a <= first && last <= b).then(|| (j.ahead_asked, of(j)));
+    let ahead = |j: &Journal| j.ahead.holds(first, last).then(|| (j.ahead_asked, of(j)));
     if let Some(known) = ahead(&journal()) {
         return Some(known);
     }
@@ -803,7 +941,7 @@ pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64],
         crate::faultbook::note(crate::faultbook::What::Known, first, last, 1);
     }
     let j = journal();
-    if !known && !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+    if !known && !j.ahead.holds(first, last) {
         return false;
     }
     let Some(taken) = first.checked_sub(base).and_then(|from| copied.get(from..last - base)) else {
@@ -3783,12 +3921,64 @@ pub(crate) mod test_books {
 mod parts_tests {
     use super::*;
 
+    /// With `VICTORY_REFRESH_SKIP`: whether the asking holds a range, by the
+    /// sorted ranges ([`Ahead`]) and by those [`ask_rest`] adds ([`Added`]),
+    /// is what the walk over all of them says, for ranges inside, across,
+    /// at the ends of and between them, nested and of one page.
+    #[test]
+    fn a_range_is_held_exactly_when_the_walk_finds_it() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut below = |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as usize % n
+        };
+        for round in 0..400 {
+            let ranges: Vec<(usize, usize)> = (0..below(40))
+                .map(|_| {
+                    let a = below(300);
+                    (a, a + 1 + below(if round % 2 == 0 { 8 } else { 120 }))
+                })
+                .collect();
+            let walk = |first: usize, last: usize| ranges.iter().any(|&(a, b)| a <= first && last <= b);
+            let mut ahead = Ahead::new();
+            SKIP_IN_TEST.store(2, std::sync::atomic::Ordering::Relaxed);
+            ahead.set(ranges.clone());
+            SKIP_IN_TEST.store(0, std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(ahead.sorted.len(), ranges.len());
+            let mut added = Added::default();
+            ranges.iter().for_each(|&(a, b)| added.add(a, b));
+            for first in 0..440 {
+                for last in first + 1..(first + 140).min(450) {
+                    let held = walk(first, last);
+                    assert_eq!(ahead.holds(first, last), held, "{ranges:?}: [{first}, {last})");
+                    assert_eq!(added.holds(first, last), held, "added {ranges:?}: [{first}, {last})");
+                }
+            }
+            // Taken and set again (as `ask_rest` does), with what it added.
+            let mut all = ahead.take();
+            assert!(ahead.is_empty() && !ahead.holds(0, 1));
+            all.extend(added.by_first.iter().map(|(&a, &b)| (a, b)));
+            SKIP_IN_TEST.store(2, std::sync::atomic::Ordering::Relaxed);
+            ahead.set(all);
+            SKIP_IN_TEST.store(0, std::sync::atomic::Ordering::Relaxed);
+            for first in (0..440).step_by(7) {
+                for last in first + 1..(first + 140).min(450) {
+                    assert_eq!(ahead.holds(first, last), walk(first, last));
+                }
+            }
+            ahead.clear();
+            assert!(!ahead.holds(0, 1));
+        }
+    }
+
     #[test]
     fn the_parts_of_a_page_written_since_it_was_taken() {
         let mut j = Journal {
             written: BTreeMap::new(),
             parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
-            ahead: Vec::new(),
+            ahead: Ahead::new(),
             ahead_asked: 0,
             kept: false,
         };
