@@ -143,3 +143,7 @@ But its screenshots show small black blocks scattered over the open water around
 tiled light running (`VICTORY_WAVE64_FIX` on): that light is left out again by default (`VICTORY_WATER_LIGHT=1`
 runs it). r67 (the same, light left out, 7 min, cutscenes on the boat): 29.3 fps over the last 2 min (min
 26.8), no black blocks in the shots; the top-down boat view was not reached in that run.
+
+r68 (`VICTORY_HEAVY2_SLOT_BATCH`: the fills' slots retire the buffers they showed in one batch a thread, not one
+global-lock hold each, ~5,800 a heavy frame): 29.1 fps mean, frames over 40 ms 1,002 (r66: 1,036), over 50 ms
+296 (r66: 345). Next by size in heavy frames: the refresh passes' wall time (4.4 -> 6.8 ms in 23 passes).
