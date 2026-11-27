@@ -138,6 +138,17 @@ struct Last {
 /// refreshes took 5 ms a frame on all threads walking in run r70, 33 MB
 /// read; detiling is the dearest step a megabyte: 0.08-0.11 ms on one
 /// thread against 0.04 for the digest and 0.03 for a copy.)
+///
+/// What it cannot catch: a first detiling has no rows to leave. Walking in
+/// run r82 the detilings of every row went from 14 a frame to 88 (up to 273)
+/// where frames took over 50 ms, against 1 in part; they are the uploads of
+/// the pass over textures picked by index (3,000 a second there against
+/// 2,500-3,000 detilings of every row; r=0.82 over the run), each through a
+/// staging buffer made for that one upload (`once`) and let go with it, and
+/// most read through the kernel (78 a frame, `no_wait`) as the runtime
+/// remaps while the world streams. The detiling itself was 2-4 ms a frame on
+/// all threads then; the pass's own time (2.2-2.7 s of 5 s) is what
+/// `VICTORY_TEXSPK_PASS_MS` (`crate::draw`) spreads over frames.
 pub(crate) fn partial() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_TEXREF_PARTIAL").is_none_or(|v| v != "0"))
@@ -645,7 +656,7 @@ pub(crate) fn let_go_idle() {
     if map.is_empty() {
         return;
     }
-    let idle_ms = crate::host::ram_idle_ms(crate::residency::headroom());
+    let idle_ms = staging_idle_ms(crate::host::ram_idle_ms(crate::residency::headroom()), texspk_staging_idle_ms());
     // A list that recorded an upload or a check holds the staging until it
     // is reset: one only the table holds is named by no list, recorded or
     // running.
@@ -664,6 +675,34 @@ pub(crate) fn let_go_idle() {
     if went > 0 {
         crate::host::trail(|| format!("sweep: {went} staging buffers of textures let go ({} KiB), held by no list", bytes >> 10));
     }
+}
+
+/// The longest a staging buffer no list used is kept, in milliseconds
+/// (`VICTORY_TEXSPK_STAGING_IDLE_MS=<n>`, 1,000 at least; unset or 0: as long
+/// as [`crate::host::ram_idle_ms`] says, as before). A staging buffer is the
+/// PC's memory the size of its texture's levels, a copy of the texture in RAM
+/// beside the one on the card: with 12 GB of RAM free and more they were kept
+/// five minutes after the last list that sampled the texture
+/// ([`crate::host::keep_freed`]); with less, 10 s, and 2 s under 2 GB. Nothing
+/// keeps one for good: those of textures picked by index go with their
+/// upload, the others by [`let_go_idle`], and all with their texture. The
+/// price of a shorter time: a texture sampled again after it is detiled and
+/// uploaded whole again (a staging buffer made anew holds nothing to detile
+/// only the changed rows into, `partial`).
+fn texspk_staging_idle_ms() -> Option<u64> {
+    static MS: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| {
+        std::env::var("VICTORY_TEXSPK_STAGING_IDLE_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&ms| ms > 0)
+            .map(|ms| ms.max(1000))
+    })
+}
+
+/// [`let_go_idle`]'s idle time: `ram`'s, no longer than `cap`.
+fn staging_idle_ms(ram: u64, cap: Option<u64>) -> u64 {
+    cap.map_or(ram, |cap| ram.min(cap))
 }
 
 /// Textures the host GPU wrote by a copy or resolve: their contents are on
@@ -3008,6 +3047,15 @@ mod partial_tests {
                 drop(title);
             }
         }
+    }
+
+    /// A staging buffer's idle time is the RAM rule's, cut to the cap.
+    #[test]
+    fn texspk_staging_idle_cap() {
+        use super::staging_idle_ms;
+        assert_eq!(staging_idle_ms(300_000, None), 300_000);
+        assert_eq!(staging_idle_ms(300_000, Some(15_000)), 15_000);
+        assert_eq!(staging_idle_ms(2_000, Some(15_000)), 2_000);
     }
 
     /// The pages of the watch, from a texture's start that is not a

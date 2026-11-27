@@ -125,7 +125,11 @@ pub(crate) fn moment() -> u64 {
 /// for seconds, and at many frames per second not for many frames. (A title
 /// that never waits for frames has no frame count: nothing is then idle.)
 pub(crate) fn long_ago(moment: u64, ms: u64, frames: u64) -> bool {
-    let now = self::moment();
+    ago(self::moment(), moment, ms, frames)
+}
+
+/// [`long_ago`] as of the moment `now`.
+pub(crate) fn ago(now: u64, moment: u64, ms: u64, frames: u64) -> bool {
     let tenths = (now & 0xffff_ffff).saturating_sub(moment & 0xffff_ffff);
     (now >> 32).saturating_sub(moment >> 32) >= frames && tenths * 100 >= ms
 }

@@ -2275,6 +2275,7 @@ pub(crate) fn let_go_idle() {
         }
         _ => (crate::host::vram_idle_ms(memory), u64::MAX),
     };
+    let (idle_ms, most, idle_frames) = evict_rule((idle_ms, most), IDLE_FRAMES, texspk_evict_frames());
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
@@ -2286,7 +2287,7 @@ pub(crate) fn let_go_idle() {
             // SAFETY: as below.
             let r = unsafe { &*(at as *const Resource) };
             let used = r.host.used.load(Relaxed);
-            if used != 0 && fills(&r.desc) && crate::host::long_ago(used, idle_ms, IDLE_FRAMES) {
+            if used != 0 && fills(&r.desc) && crate::host::long_ago(used, idle_ms, idle_frames) {
                 by_age.push((used & 0xffff_ffff, at));
             }
         }
@@ -2301,7 +2302,7 @@ pub(crate) fn let_go_idle() {
     let whole = *WHOLE.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_some_and(|v| v == "whole"));
     let part = if most != u64::MAX {
         0
-    } else if whole || idle_ms < 60_000 {
+    } else if whole || (idle_ms < 60_000 && texspk_evict_frames().is_none()) {
         usize::MAX
     } else {
         PART
@@ -2322,13 +2323,13 @@ pub(crate) fn let_go_idle() {
         let r = unsafe { &*(at as *const Resource) };
         // (Without its lock first: most were used lately or have none.)
         let used = r.host.used.load(Relaxed);
-        if used == 0 || !fills(&r.desc) || !crate::host::long_ago(used, idle_ms, IDLE_FRAMES) || crate::texture::host_wrote(at) {
+        if used == 0 || !fills(&r.desc) || !crate::host::long_ago(used, idle_ms, idle_frames) || crate::texture::host_wrote(at) {
             continue;
         }
         let gone = {
             let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
             let idle = made.as_ref().is_some_and(|(host, _)| {
-                crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
+                crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, idle_frames)
                     && std::sync::Arc::strong_count(host) == 1
                     && crate::host::references(&host.texture) == 1
             });
@@ -2365,6 +2366,47 @@ pub(crate) fn let_go_idle() {
                 first.unwrap_or(0)
             )
         });
+    }
+}
+
+/// How many frames a host copy of a texture the title fills must have gone
+/// unused to be let go while the card has room (`VICTORY_TEXSPK_EVICT_FRAMES=<n>`,
+/// 60 to 1,000,000; unset or 0: none go then but those of ten minutes, as
+/// before), and as many 30ths of a second, five seconds at least
+/// ([`evict_rule`]). The other rules of [`let_go_idle`] stay: only a copy no
+/// list and no descriptor slot holds goes, and none the host copied into, so
+/// a texture a slot still shows is kept however long it was not used.
+///
+/// Without it the card's memory fills up to the queue's line and stays there
+/// (run r82, walking: 3.6 GB at the world's first frame, 16.7 GB at 15:34,
+/// 21.4 GB of a 22.0 GB line at 15:39, "no room" at 15:40), and only near
+/// the line do copies go, the longest idle first (21.4 GB to 19.8 GB in the
+/// two minutes after). The price of letting them go sooner: a texture used
+/// again is made, detiled and uploaded again.
+#[cfg(windows)]
+fn texspk_evict_frames() -> Option<u64> {
+    static FRAMES: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *FRAMES.get_or_init(|| {
+        std::env::var("VICTORY_TEXSPK_EVICT_FRAMES")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&n| n > 0)
+            .map(|n| n.clamp(60, 1_000_000))
+    })
+}
+
+/// [`let_go_idle`]'s idle time, bytes at most and idle frames, from what the
+/// card's room says (`room`: idle milliseconds and bytes at most) and
+/// [`texspk_evict_frames`] (`evict`): with room (no bytes limit) a copy idle
+/// `evict` frames and as many 30ths of a second goes; short of room the room's
+/// rule stands, with `frames` (it lets go of more, the longest idle first).
+fn evict_rule((idle_ms, most): (u64, u64), frames: u64, evict: Option<u64>) -> (u64, u64, u64) {
+    match evict {
+        Some(n) if most == u64::MAX => {
+            let ms = (n * 1000 / 30).max(5_000);
+            (idle_ms.min(ms), most, frames.max(n))
+        }
+        _ => (idle_ms, most, frames),
     }
 }
 
@@ -3553,6 +3595,32 @@ pub(crate) fn test_buffer(width: u64) -> This {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn texspk_eviction_lets_idle_copies_go_and_keeps_used_ones() {
+        use super::evict_rule;
+        const MAX: u64 = u64::MAX;
+        // Unset: the room's rule as it was.
+        assert_eq!(evict_rule((600_000, MAX), 4, None), (600_000, MAX, 4));
+        // With room: idle 900 frames and 30 s go (not ten minutes).
+        assert_eq!(evict_rule((600_000, MAX), 4, Some(900)), (30_000, MAX, 900));
+        // Few frames: five seconds at least.
+        assert_eq!(evict_rule((600_000, MAX), 4, Some(60)), (5_000, MAX, 60));
+        // Short of room: the room's rule (shorter, with a bytes limit) stands.
+        assert_eq!(evict_rule((1_500, 1 << 30), 4, Some(900)), (1_500, 1 << 30, 4));
+        // A moment: the frame in the high half, tenths of a second in the low.
+        let at = |frame: u64, tenths: u64| frame << 32 | tenths;
+        let (ms, _, frames) = evict_rule((600_000, MAX), 4, Some(900));
+        let now = at(10_000, 5_000);
+        // Used ten frames ago: kept.
+        assert!(!crate::host::ago(now, at(9_990, 4_999), ms, frames));
+        // Used 1,000 frames ago but within 30 s (a fast title): kept.
+        assert!(!crate::host::ago(now, at(9_000, 4_900), ms, frames));
+        // Used 1,000 frames and 40 s ago: goes.
+        assert!(crate::host::ago(now, at(9_000, 4_600), ms, frames));
+        // Without the switch the same copy stays (ten minutes).
+        assert!(!crate::host::ago(now, at(9_000, 4_600), 600_000, 4));
+    }
+
     use super::*;
     use crate::object::slot;
 
