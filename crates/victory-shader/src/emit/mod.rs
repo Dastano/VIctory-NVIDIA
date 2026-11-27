@@ -90,6 +90,7 @@ mod diff_tests;
 mod filter3d_tests;
 #[cfg(all(test, windows))]
 mod intersect_tests;
+mod lds_init;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lower;
@@ -120,6 +121,7 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
 pub use sampler::StaticSampler;
+pub use lds_init::wave64_fix;
 pub use lower::{host_settings, set_host_max_wave, set_host_rdna};
 pub use rect::rect_list_gs;
 pub use shader::{
