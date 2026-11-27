@@ -700,3 +700,26 @@ fn a_structure_that_returns_triangle_ids_is_refused_by_name() {
         other => panic!("{:?}", other.map(|_| ())),
     }
 }
+
+#[test]
+fn with_probe_rays_the_node_test_asks_the_host_whether_the_structure_is_empty() {
+    // (`VICTORY_PROBE_RAYS`) Both ways of naming the nodes lower and
+    // validate with the host's word that says the structure was never
+    // built; without the switch the program has no such word.
+    let asks = |shader: &HostShader| {
+        shader
+            .user_data
+            .iter()
+            .any(|u| u.root == RootType::Other(super::USER_BVH_EMPTY))
+    };
+    for (wide, descriptor) in [(true, WHOLE), (false, Descriptor::Table)] {
+        let (off, _) = build(wide, descriptor).expect("lowers without the switch");
+        assert!(!asks(&off));
+        super::PROBE_RAYS_FOR_TESTS.with(|c| c.set(Some(true)));
+        let on = build(wide, descriptor);
+        super::PROBE_RAYS_FOR_TESTS.with(|c| c.set(None));
+        let (on, _) = on.expect("lowers with the switch");
+        assert!(asks(&on));
+        assert_eq!(on.user_data.len(), off.user_data.len() + 1);
+    }
+}

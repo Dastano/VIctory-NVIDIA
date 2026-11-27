@@ -162,6 +162,14 @@ fork's constant.
 
 It is off while the builder runs.
 
+`VICTORY_PROBE_RAYS` (on unless `VICTORY_BVH_BUILDER=1`; `0` off; from
+Op-lite/victory-scarlett 183ac80): every node test answers as against an empty
+structure (the host's word `USER_BVH_EMPTY`), and the screen probes'
+`CS_ScreenProbes_ActivateRays` is made and runs. Without it that program was
+left out and the probes kept stale memory, which showed as violet bushes,
+trees and palms. Programs with a node test translate differently while it is
+on (the shader cache keys on it).
+
 ## Where to look
 
 - `crates/victory-shader/src/bvh.rs`: the reference for the node test.

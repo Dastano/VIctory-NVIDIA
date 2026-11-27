@@ -1655,6 +1655,10 @@ impl State {
         if kind == victory_shader::emit::USER_DISPATCH_THREADS_X {
             return 0;
         }
+        // (`VICTORY_PROBE_RAYS`) The structures are empty: never built.
+        if kind == victory_shader::emit::USER_BVH_EMPTY {
+            return u32::from(!crate::pipeline::builder_runs());
+        }
         if kind == USER_ROOT_ADDRESS || kind == USER_ROOT_ADDRESS + 1 {
             return match self.roots_ref(compute).get(usize::from(slot)) {
                 Some(&Root::View(address)) if kind == USER_ROOT_ADDRESS => address as u32,
@@ -1768,8 +1772,50 @@ impl State {
         self.prepare_for(list, indexed, false)
     }
 
-    /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches.
+    /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches:
+    /// [`State::prepare_for_once`], with a depth plane used before its pass
+    /// given its twin's contents first (`VICTORY_PLANE_NOW`, [`State::planes_due`]).
     fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
+        let done = self.prepare_for_once(list, indexed, mesh);
+        if done && self.planes_due(list) {
+            return self.prepare_for_once(list, indexed, mesh);
+        }
+        done
+    }
+
+    /// After a bind: depth planes this draw or dispatch uses before the pass
+    /// that gives them their twin's contents (`HostList::twin_use`). Logged
+    /// (the first 30). With `VICTORY_PLANE_NOW` (`crate::host::plane_now`) the
+    /// pass is recorded now and the title's state set again on the list: true
+    /// then, and the caller binds anew. (Op-lite/victory-scarlett 50bd954,
+    /// 183ac80.)
+    fn planes_due(&mut self, list: &HostList) -> bool {
+        let late = list.take_plane_late();
+        if late.is_empty() {
+            return false;
+        }
+        static SAID: AtomicU64 = AtomicU64::new(0);
+        if SAID.fetch_add(1, Ordering::Relaxed) < 30 {
+            for (depth, _) in &late {
+                // SAFETY: a live texture.
+                let d = unsafe { depth.texture.GetDesc() };
+                tracing::warn!(
+                    pipeline = format_args!("{:#x}", self.pipeline),
+                    depth = format_args!("{}x{}x{} format {}", d.Width, d.Height, d.DepthOrArraySize, d.Format.0),
+                    now = crate::host::plane_now(),
+                    "a depth plane used before the pass that gives it its twin's contents (VICTORY_PLANE_NOW: the pass before this use)"
+                );
+            }
+        }
+        if !crate::host::plane_now() {
+            return false;
+        }
+        list.planes_now(&late);
+        self.replay(list);
+        true
+    }
+
+    fn prepare_for_once(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return false;
@@ -3718,7 +3764,7 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
-        if !self.bind(list, p, true) {
+        if !self.bind(list, p, true) || (self.planes_due(list) && !self.bind(list, p, true)) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
             // dropped stage: the others stop too.
@@ -5290,7 +5336,7 @@ impl State {
             let ran = match kind {
                 DRAW | INDEXED => self.prepare(list, kind == INDEXED),
                 MESH => self.prepare_for(list, false, true),
-                DISPATCH => self.bind(list, p, true),
+                DISPATCH => self.bind(list, p, true) && (!self.planes_due(list) || self.bind(list, p, true)),
                 _ => false,
             };
             if !ran {
