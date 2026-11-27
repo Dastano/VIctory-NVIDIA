@@ -140,6 +140,7 @@ Every `VICTORY_...` switch is described in a comment where the code reads it. Th
 | `VICTORY_PRELUDE_UPLOADS`, `VICTORY_SHOW_NEW_LATER`, `VICTORY_TABLED_REREAD` | on | texture upload order and slot changes (flicker, device losses) |
 | `VICTORY_SYNC_IN_PLACE`, `VICTORY_SPANS_QUICK`, `VICTORY_HEAP_SYNC_AT_SUBMIT` | on | cheaper descriptor-heap bookkeeping |
 | `VICTORY_PORT_CONSTANTS` | off | the title's constants heap read in place: less CPU, but on a 12 GB card the GPU then waits (slower overall) |
+| `VICTORY_PORT_CBV` | off | constant buffers read by translated shaders as raw bytes where the title has them, not copied at every submission (with `VICTORY_PORT_CONSTANTS=1`; its own shader cache) |
 | `VICTORY_FRAME_INTERVAL_MS` | off | experimental: the title's own 30 fps setting patched to a higher rate |
 | `VICTORY_BVH_BUILDER` | off | the title's ray tracing (slow, broken) |
 

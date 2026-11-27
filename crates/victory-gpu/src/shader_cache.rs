@@ -96,6 +96,12 @@ fn build() -> [u8; 32] {
         }
         // And which clean-up passes ran over the translated code.
         bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
+        // So is renderer port 5 (`VICTORY_PORT_CBV=1`, constant buffers read
+        // as raw bytes): only while it is on, after everything else, so that
+        // the translations cached without it keep their key.
+        if victory_shader::emit::constants_raw() {
+            bytes.extend_from_slice(b"VICTORY_PORT_CBV=1");
+        }
         bytes
     });
     let mut hash = blake3::Hasher::new();
