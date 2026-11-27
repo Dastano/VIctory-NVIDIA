@@ -899,6 +899,10 @@ pub(crate) fn constant_slots(
     slots: impl Iterator<Item = (usize, u32, u64, u32)>,
     buffer: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
 ) {
+    let batch = slot_batch();
+    // SAFETY: a live buffer.
+    let base = unsafe { buffer.GetGPUVirtualAddress() };
+    let mut let_go = Vec::new();
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     let mut last: Option<(usize, Option<&host::HostHeap>)> = None;
     for (heap, index, gpu, size) in slots {
@@ -917,9 +921,43 @@ pub(crate) fn constant_slots(
             }
         };
         if let Some(host) = host {
-            host.constant_at(index, buffer, gpu, size);
+            if batch {
+                let_go.extend(host.constant_at_from(index, buffer, base, gpu, size));
+            } else {
+                host.constant_at(index, buffer, gpu, size);
+            }
         }
     }
+    drop(heaps);
+    crate::host::retire_resources(let_go);
+}
+
+/// The fills' slots of a submission ([`constant_slots`]) let go of what
+/// they showed before all at once, after the last of them: one hold of the
+/// lock of what waits for running submissions, and one entry there, for
+/// each of the threads that make them, instead of one for each slot; and
+/// the buffer's card address asked for once. `VICTORY_HEAVY2_SLOT_BATCH=0`:
+/// one at a time, as before.
+///
+/// Why: with 6,000 fills a frame (run r66, the heavy seconds) the fills'
+/// slots took 2.6 ms of the submitting thread a frame (0.4 in the light
+/// ones), the part of the planning of steps on the card that grew most.
+/// Each slot showed the buffer between of an earlier submission (they come
+/// from a pool), so nearly every one let go of one, under the lock every
+/// thread that retires anything takes, on several threads at once and
+/// beside the threads translating the title's lists, which retire what
+/// their slots showed under the same lock.
+///
+/// Why it is the same: each slot is made the same descriptors of the same
+/// bytes and holds the same buffer; what it let go of is the same reference
+/// (`held_swap_tests`), kept until the submissions started when the batch
+/// is retired have finished: those started when it was let go and perhaps
+/// more, never fewer. Nothing reads a slot's old buffer through it after
+/// the slot is made again.
+#[cfg(windows)]
+fn slot_batch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAVY2_SLOT_BATCH").is_none_or(|v| v != "0"))
 }
 
 #[cfg(windows)]

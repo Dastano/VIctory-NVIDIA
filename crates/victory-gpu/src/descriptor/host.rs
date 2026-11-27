@@ -3478,25 +3478,12 @@ impl HostHeap {
 
     /// [`HostHeap::keep`], `resource` taken another reference of only if it
     /// is not what the slot views already (thousands of slots a frame show
-    /// one buffer, from several threads at once).
-    fn keep_ref(&self, index: u32, resource: Option<&ID3D12Resource>) {
-        let Some(slot) = self.kept.get(index as usize) else {
-            return;
-        };
-        let old = {
-            use windows::core::Interface;
-            let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
-            // The same again: nothing to retire.
-            if slot.as_ref().map(Interface::as_raw) == resource.map(Interface::as_raw) {
-                return;
-            }
-            std::mem::replace(&mut *slot, resource.cloned())
-        };
-        // A running submission may still read the old resource through
-        // this slot.
-        if let Some(old) = old {
-            crate::host::retire_resource(old);
-        }
+    /// one buffer, from several threads at once): what it viewed before if
+    /// that was another, for the caller to retire (a running submission may
+    /// still read it through this slot).
+    fn kept_swap(&self, index: u32, resource: Option<&ID3D12Resource>) -> Option<ID3D12Resource> {
+        use windows::core::Interface;
+        held_swap(self.kept.get(index as usize)?, resource, |a, b| a.as_raw() == b.as_raw())
     }
 
     /// What slot `index` views.
@@ -3630,9 +3617,22 @@ impl HostHeap {
     /// lost the device to a page fault in the memory of three freed ones.
     /// `VICTORY_SLOT_HOLDS=0`: only the list holds it, as before.
     pub(crate) fn constant_at(&self, index: u32, buffer: &ID3D12Resource, gpu: u64, size: u32) {
+        if let Some(old) = self.constant_made(index, buffer, None, gpu, size) {
+            crate::host::retire_resource(old);
+        }
+    }
+
+    /// [`HostHeap::constant_at`] of `buffer` whose card address is `base`,
+    /// what the slot viewed before (if another) given back for the caller
+    /// to retire with others ([`crate::host::retire_resources`]).
+    pub(crate) fn constant_at_from(&self, index: u32, buffer: &ID3D12Resource, base: u64, gpu: u64, size: u32) -> Option<ID3D12Resource> {
+        self.constant_made(index, buffer, Some(base), gpu, size)
+    }
+
+    fn constant_made(&self, index: u32, buffer: &ID3D12Resource, base: Option<u64>, gpu: u64, size: u32) -> Option<ID3D12Resource> {
         static HOLDS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let holds = *HOLDS.get_or_init(|| std::env::var_os("VICTORY_SLOT_HOLDS").is_none_or(|v| v != "0"));
-        let Some(host) = host() else { return };
+        let host = host()?;
         let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
             BufferLocation: gpu,
             SizeInBytes: constant_bytes(size),
@@ -3647,7 +3647,7 @@ impl HostHeap {
         let twin = self.twin(index).filter(|_| desc.SizeInBytes > 0);
         if let Some(twin) = twin {
             // SAFETY: a live buffer that holds the range.
-            let first = (gpu - unsafe { buffer.GetGPUVirtualAddress() }) / 4;
+            let first = (gpu - base.unwrap_or_else(|| unsafe { buffer.GetGPUVirtualAddress() })) / 4;
             let raw = D3D12_SHADER_RESOURCE_VIEW_DESC {
                 Format: DXGI_FORMAT_R32_TYPELESS,
                 ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
@@ -3668,7 +3668,7 @@ impl HostHeap {
         self.write_stride(index, 0);
         // After the descriptor: what it showed is let go when nothing shows
         // it any more.
-        self.keep_ref(index, holds.then_some(buffer));
+        self.kept_swap(index, holds.then_some(buffer))
     }
 
     /// Renderer port 5 (`crate::port_cbv`): makes slot `index` (a dynamic
@@ -5389,6 +5389,72 @@ fn changed_records(last: &mut [u8], records: &[u8], step: usize, first: u32, out
                 out.push(first + (b * AT_A_TIME + n) as u32);
             }
         }
+    }
+}
+
+/// `slot` now holds `resource` (a reference of its own); what it held
+/// before, if that was another (`same` tells), for the caller to retire.
+/// Nothing if it was the same: the slot keeps its reference.
+fn held_swap<T: Clone>(slot: &Mutex<Option<T>>, resource: Option<&T>, same: impl Fn(&T, &T) -> bool) -> Option<T> {
+    let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+    let unchanged = match (slot.as_ref(), resource) {
+        (Some(a), Some(b)) => same(a, b),
+        (None, None) => true,
+        _ => false,
+    };
+    if unchanged {
+        return None;
+    }
+    std::mem::replace(&mut *slot, resource.cloned())
+}
+
+#[cfg(test)]
+mod held_swap_tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::held_swap;
+
+    /// What the fills' slots let go of, gathered and retired at once
+    /// (`VICTORY_HEAVY2_SLOT_BATCH`), is what they let go of one by one:
+    /// the same references, in the same order, none of them dropped before
+    /// the batch is, and the slots holding what they were made from.
+    #[test]
+    fn slots_let_go_of_the_same_in_a_batch() {
+        let buffers: Vec<Arc<u32>> = (0..3).map(Arc::new).collect();
+        // (slot, buffer) in the order the fills make them: the same buffer
+        // again, another, none.
+        let fills = [(0, Some(0)), (1, Some(0)), (0, Some(0)), (0, Some(1)), (2, Some(2)), (1, None), (1, Some(1)), (2, Some(2)), (2, Some(0))];
+        let run = |batched: bool| {
+            let slots: Vec<Mutex<Option<Arc<u32>>>> = (0..3).map(|_| Mutex::new(None)).collect();
+            let mut one_by_one = Vec::new();
+            let mut batch = Vec::new();
+            for &(slot, buffer) in &fills {
+                let old = held_swap(&slots[slot], buffer.map(|b: usize| &buffers[b]), |a, b| Arc::ptr_eq(a, b));
+                if let Some(old) = old {
+                    if batched {
+                        batch.push(old);
+                    } else {
+                        one_by_one.push(*old);
+                    }
+                }
+            }
+            // Every reference let go is still alive until the batch is dropped.
+            let held: Vec<usize> = buffers.iter().map(Arc::strong_count).collect();
+            let shown: Vec<Option<u32>> = slots.iter().map(|s| s.lock().unwrap().as_deref().copied()).collect();
+            let let_go: Vec<u32> = if batched { batch.iter().map(|b| **b).collect() } else { one_by_one };
+            drop(batch);
+            (let_go, shown, held, slots)
+        };
+        let (alone, shown_alone, _, slots_alone) = run(false);
+        let (batched, shown_batched, held, slots_batched) = run(true);
+        assert_eq!(alone, [0, 0, 2]);
+        assert_eq!(batched, alone);
+        assert_eq!(shown_batched, shown_alone);
+        assert_eq!(shown_batched, [Some(1), Some(1), Some(0)]);
+        // 1 (ours) + those in slots of both runs at that time + the batch's.
+        assert_eq!(held, [1 + 1 + 1 + 2, 1 + 2 + 2, 1 + 1]);
+        drop((slots_alone, slots_batched));
+        assert!(buffers.iter().all(|b| Arc::strong_count(b) == 1));
     }
 }
 

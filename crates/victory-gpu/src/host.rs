@@ -86,6 +86,9 @@ enum Retired {
     Any(Box<dyn std::any::Any>),
     /// What a descriptor slot showed: 20,000 a frame, without a box each.
     Resource(ID3D12Resource),
+    /// What the fills' slots of one submission showed
+    /// ([`retire_resources`]).
+    Resources(Vec<ID3D12Resource>),
 }
 // SAFETY: what is retired is D3D12 objects (free-threaded) and the
 // reference-counted wrappers holding them, dropped once.
@@ -497,6 +500,28 @@ pub(crate) fn retire_resource(object: ID3D12Resource) {
     }
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
     RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push_back((started, Retired::Resource(object)));
+}
+
+/// [`retire_resource`] for each of `objects`, under one hold of the lock
+/// and as one entry: the fills' slots of a submission let go of thousands
+/// a frame on several threads at once, each a hold of the lock every
+/// thread that retires anything takes (`descriptor::constant_slots`,
+/// `VICTORY_HEAVY2_SLOT_BATCH`). The submissions counted are those started
+/// now, later than when each was let go: none is dropped sooner.
+pub(crate) fn retire_resources(objects: Vec<ID3D12Resource>) {
+    if objects.is_empty() {
+        return;
+    }
+    let n = objects.len() as u64;
+    let queued = crate::queue::queued();
+    let started = STARTED.load(Ordering::Acquire) + queued;
+    if bury_lag() == 0 && started <= FINISHED.load(Ordering::Acquire) {
+        RETIREMENTS[0].fetch_add(n, Ordering::Relaxed);
+        drop(objects);
+        return;
+    }
+    RETIREMENTS[1].fetch_add(n, Ordering::Relaxed);
+    RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push_back((started, Retired::Resources(objects)));
 }
 
 /// How many submissions later than it could (the last one that may use it
