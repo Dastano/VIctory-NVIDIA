@@ -191,3 +191,8 @@ light runs by default again. r79 (walking, DLAA): 29.17 fps, preparing 16.5-19.5
 shots every 8 s, window on the primary display): the open water around the boat is lit (turquoise) with no black
 blocks anywhere in the top-down shots; 29.1 fps over the last 2 minutes. Not taken: soldier16's two-stage submit
 pipelining (a possible race; tied to its other changes).
+
+r81 (walking, DLAA, `-Fps 1000`, i.e. no cap): 34.8 fps mean, preparing 16.3 ms, lowest line 19.4, longest frame
+201 ms; 20 of 114 fps lines under 29.5 (capped r79: 21 of 132). So the build has headroom on average (35 fps
+walking), and the dips under 30 sit at the same places with or without the cap: heavy moments of the title's own
+work, not the cap. `-Fps 30` (default) gives the evener frame times; `-Fps 1000` the higher average.
