@@ -196,3 +196,8 @@ r81 (walking, DLAA, `-Fps 1000`, i.e. no cap): 34.8 fps mean, preparing 16.3 ms,
 201 ms; 20 of 114 fps lines under 29.5 (capped r79: 21 of 132). So the build has headroom on average (35 fps
 walking), and the dips under 30 sit at the same places with or without the cap: heavy moments of the title's own
 work, not the cap. `-Fps 30` (default) gives the evener frame times; `-Fps 1000` the higher average.
+
+r82 (walking, DLSS Quality, no cap): 39.4 fps mean, 14 of 115 lines under 29.5 (7 under 27), over 50 ms 300,
+longest 224 ms; the card 88-90 % busy. With DLAA and no cap (r81) the card was 90-95 % busy at 34.8 fps: DLAA
+plus the water light make the card part of the limit once the cap is off. Best measured setup for frame rate:
+DLSS Quality, no cap.
