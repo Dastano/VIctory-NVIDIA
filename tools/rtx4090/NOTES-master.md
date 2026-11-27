@@ -161,3 +161,8 @@ cause outside the layer: on this PC the 3440x1440 monitor is driven by the CPU's
 RTX 4090, and a Parsec virtual display is the primary display; every frame crosses adapters, and frame generation
 (which paces presents on the display it is connected to) cannot pace across that. To check with the monitor on
 the 4090.
+
+r73: the same as r72 with the game window moved onto the display the RTX 4090 drives (the run's window had opened
+on the primary display, a Parsec virtual display): 27.7 rendered fps mean, 31 presents / 61 frames shown a second,
+7 ms in the present. So the 15/30 lock came from presenting on a display not on the 4090. Play with the window on
+a display connected to the 4090 (and the Parsec virtual display off or not primary).
