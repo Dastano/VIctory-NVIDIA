@@ -1051,6 +1051,23 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
         .then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
 }
 
+/// The number of the asking that stands ([`ask_once`]; moved on by
+/// [`wrote`]): what a refresh answered by the journal now takes its pages as
+/// of (`crate::host`'s `VICTORY_FEWER_PAST_COPIES`).
+pub(crate) fn asking_stands() -> u64 {
+    journal().ahead_asked
+}
+
+/// Whether a refresh of `[start, end)` now is answered by the journal alone
+/// (the submission's one asking stands and holds the range, as [`writes`]
+/// asks first) and finds no page of it noted written by an asking after
+/// `since` (nor by [`wrote`] since then: its notes count as askings).
+pub(crate) fn unchanged_since(start: usize, end: usize, since: u64) -> bool {
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    let j = journal();
+    j.kept && j.ahead.holds(first, last) && j.written.range(first..last).all(|(_, &w)| w <= since)
+}
+
 /// The pages of `[start, end)` (whole pages) as last written, for pages
 /// written since tracking began: `(page number, asking)` in page order, and
 /// this asking's number, which is higher than any in the list but those the

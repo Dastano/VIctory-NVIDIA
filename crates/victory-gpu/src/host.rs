@@ -8072,7 +8072,9 @@ impl HostList {
                     let free = !touches(air, p.src, p.src + p.len) && !touches(air, p.dst, p.dst + p.len);
                     batch.fill();
                     if free {
-                        batch.title_written();
+                        // It writes `[p.dst, p.dst + p.len)` alone, noted
+                        // in the journal (`Placed::prepare`).
+                        batch.title_copied();
                     }
                     if let Some(bytes) = p.prepare(free) {
                         batch.placed.push((p.shadow.clone(), p.dst, bytes));
@@ -8348,7 +8350,8 @@ fn submit_split_line(frames: f64) {
         tracing::info!(
             "the refreshes ({:.1} ms) per frame, the submitting thread: {:.1} looking at {:.0} before waking threads, {:.1} asking \
              ahead, {:.1} one at a time in {:.0}, {:.1} in {:.0} passes on several threads; refreshes summed over the threads \
-             {:.1} ms, {:.1} MB copied (VICTORY_REFRESH_WIDE is {})",
+             {:.1} ms, {:.1} MB copied (VICTORY_REFRESH_WIDE is {}); {:.0} left out past copies into title memory, known \
+             to copy nothing (VICTORY_FEWER_PAST_COPIES is {})",
             ms[6],
             r[0] / 1e6,
             r[1],
@@ -8360,6 +8363,8 @@ fn submit_split_line(frames: f64) {
             r[7] / 1e6,
             r[8] / 1e6,
             if refresh_wide() { "on" } else { "off" },
+            FEWER.swap(0, Ordering::Relaxed) as f64 / frames,
+            if fewer_past_copies() { "on" } else { "off" },
         );
     }
     let c: [f64; 5] = std::array::from_fn(|i| CARD_PARTS[i].swap(0, Ordering::Relaxed) as f64 / 1e6 / frames);
@@ -8527,7 +8532,70 @@ struct Batch {
     kept: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     /// Per copy (by address), how many of `kept` are its.
     kept_of: ByCopy<usize>,
+    /// With [`fewer_past_copies`]: the title's copies into title memory
+    /// (of known ranges) since `ahead` was made, which left it standing.
+    past: u32,
+    /// The asking that stood when `ahead` was made
+    /// (`crate::watch::asking_stands`).
+    ahead_asked: u64,
+    /// Past such a copy, refreshes inside `ahead` of copies with none
+    /// pending: per copy (by address) the span of them, as it would be
+    /// pending. Done at the flush that would have done it, unless the
+    /// journal tells it would copy nothing ([`Batch::settle_skipped`]).
+    skipped: ByCopy<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    /// How many of `skipped` were left out (for tests; also in [`FEWER`]).
+    left_out: usize,
 }
+
+/// `VICTORY_FEWER_PAST_COPIES` (read here; on by default, `=0` as before):
+/// a copy into title memory of a known range ([`Step::Copy`], and
+/// [`Step::Placed`]) no longer drops what was brought up to date ahead of
+/// the steps ([`Batch::ahead`]). It dropped all of it: every later refresh
+/// of the submission, of every copy, was pending again and looked at in
+/// another flush, although such a copy writes a few bytes of one buffer
+/// (27.7 copies at their place a frame in the boat drive r102, 94 KB in
+/// all, with ~38 flushes and ~6,900 refreshes a frame, 86% of them known to
+/// copy nothing).
+///
+/// Past such a copy, the refreshes inside `ahead` of a copy that has none
+/// pending are gathered per copy as they would be pending
+/// ([`Batch::skipped`]); one outside, or one already pending, takes them in
+/// as before. At the flush that would have done them (the next copy into
+/// title memory, a shader write of the copy, the end), each is done as
+/// before unless the journal answers its refresh (the submission's one
+/// asking stands and holds its range, the copy is write-watched) and no page
+/// of it was noted written after the asking that stood when `ahead` was
+/// made (`crate::watch::unchanged_since`): that refresh copies the pages
+/// written after they were taken, and the refresh in front took them all
+/// as of that asking. The title's copies note what they write in the
+/// journal (`crate::watch::wrote`, the pages its other views show too), so
+/// a copy that touches the range has it refreshed as before; so does any
+/// other write the journal learns of meanwhile. The same refreshes copy the
+/// same bytes: only those that would find nothing new are left out (and
+/// the ends of a range, pages it holds in part, which a refresh may take
+/// again, hold what they held: nothing noted wrote them). A step that
+/// writes title memory where it is not known ([`Step::Run`]) drops `ahead`
+/// as before.
+fn fewer_past_copies() -> bool {
+    #[cfg(test)]
+    if let Some(on) = FEWER_PAST_COPIES_IN_TEST.get() {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FEWER_PAST_COPIES").is_none_or(|v| v != "0"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// [`fewer_past_copies`] for what this thread decides (`None`: as the
+    /// environment says).
+    static FEWER_PAST_COPIES_IN_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Since the last frame-rate line: refreshes left out past copies into
+/// title memory ([`fewer_past_copies`]), each one a flush would have looked
+/// at.
+static FEWER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// `VICTORY_PASSES_KEEP` (read here; on by default, `=0` as before): a copy
 /// into title memory ([`Step::Copy`]) flushes only the pending refreshes
@@ -9055,6 +9123,10 @@ impl Batch {
         self.touches.clear();
         self.kept.clear();
         self.kept_of.clear();
+        self.past = 0;
+        self.ahead_asked = 0;
+        self.skipped.clear();
+        self.left_out = 0;
         SPARE_BATCH.set(Some(self));
     }
 
@@ -9116,7 +9188,16 @@ impl Batch {
         let end = address + len;
         let key = std::sync::Arc::as_ptr(shadow) as usize;
         if self.ahead.get(&key).is_some_and(|&(from, to)| from <= address && end <= to) {
-            return;
+            if self.past == 0 {
+                return;
+            }
+            // Past a copy into title memory ([`fewer_past_copies`]): as it
+            // would be pending, unless the copy has one pending already.
+            if !self.index.contains_key(&key) {
+                let s = self.skipped.entry(key).or_insert_with(|| (shadow.clone(), address, end));
+                (s.1, s.2) = (s.1.min(address), s.2.max(end));
+                return;
+            }
         }
         match self.index.get(&key) {
             Some(&at) => {
@@ -9124,10 +9205,74 @@ impl Batch {
                 (r.1, r.2) = (r.1.min(address), r.2.max(end));
             }
             None => {
+                // With what was gathered of it past a copy, as before.
+                let (mut from, mut to) = (address, end);
+                if !self.skipped.is_empty()
+                    && let Some((_, a, b)) = self.skipped.remove(&key)
+                {
+                    (from, to) = (from.min(a), to.max(b));
+                }
                 self.index.insert(key, self.refreshes.len());
-                self.refreshes.push((shadow.clone(), address, end));
+                self.refreshes.push((shadow.clone(), from, to));
             }
         }
+    }
+
+    /// [`Batch::skipped`] (all, or only the copy `only`) before the flush
+    /// that would have done them: pending as before, but those whose
+    /// refresh the journal answers with nothing written after `ahead` was
+    /// made, which are left out ([`fewer_past_copies`]).
+    fn settle_skipped(&mut self, only: Option<usize>) {
+        if self.skipped.is_empty() {
+            return;
+        }
+        let settle = |batch: &mut Batch, shadow: std::sync::Arc<crate::shadow::Shadow>, from: usize, to: usize| {
+            let (start, len) = shadow.span();
+            let (a, b) = (from.max(start as usize), to.min((start + len) as usize));
+            let nothing = shadow.in_place()
+                || a >= b
+                || !shadow.unwatched() && crate::watch::unchanged_since(a, b, batch.ahead_asked);
+            if nothing {
+                batch.left_out += 1;
+                FEWER.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            batch.index.insert(std::sync::Arc::as_ptr(&shadow) as usize, batch.refreshes.len());
+            batch.refreshes.push((shadow, from, to));
+        };
+        match only {
+            Some(key) => {
+                if let Some((shadow, from, to)) = self.skipped.remove(&key) {
+                    settle(self, shadow, from, to);
+                }
+            }
+            None => {
+                let skipped = std::mem::take(&mut self.skipped);
+                for (_, (shadow, from, to)) in skipped {
+                    settle(self, shadow, from, to);
+                }
+            }
+        }
+    }
+
+    /// After a copy into title memory of a known range: `ahead` stands
+    /// with [`fewer_past_copies`], else it is dropped, as before.
+    fn past_copy(&mut self) {
+        if fewer_past_copies() && !self.ahead.is_empty() {
+            self.past += 1;
+        } else {
+            self.ahead.clear();
+            self.past = 0;
+        }
+    }
+
+    /// Before a copy at its place in a list ([`Step::Placed`]) puts its
+    /// bytes into title memory: as [`Batch::title_written`], but `ahead`
+    /// stands ([`fewer_past_copies`]).
+    fn title_copied(&mut self) {
+        self.flush();
+        self.past_copy();
+        self.textures.clear();
     }
 
     /// Before shaders are given a range of `shadow`'s copy: its pending
@@ -9138,6 +9283,9 @@ impl Batch {
         if !self.front {
             self.ahead.remove(&(std::sync::Arc::as_ptr(shadow) as usize));
         }
+        // What was gathered of it past a copy into title memory, as it would
+        // be pending ([`fewer_past_copies`]).
+        self.settle_skipped(Some(std::sync::Arc::as_ptr(shadow) as usize));
         // Its refreshes kept past copies first ([`passes_keep`]), in order.
         if self.kept_of.remove(&(std::sync::Arc::as_ptr(shadow) as usize)).is_some() {
             let key = std::sync::Arc::as_ptr(shadow);
@@ -9198,6 +9346,7 @@ impl Batch {
     fn title_written(&mut self) {
         self.flush();
         self.ahead.clear();
+        self.past = 0;
         self.textures.clear();
     }
 
@@ -9294,6 +9443,7 @@ impl Batch {
         due: Vec<std::sync::Arc<crate::texture::Staging>>,
     ) {
         self.front = true;
+        self.ahead_asked = crate::watch::asking_stands();
         for (shadow, from, to) in &spans {
             self.ahead.insert(std::sync::Arc::as_ptr(shadow) as usize, (*from, *to));
         }
@@ -9391,6 +9541,7 @@ impl Batch {
             .into_iter()
             .filter_map(|(key, from, to)| Some((copies.get(&key)?.clone(), from, to)))
             .collect();
+        self.ahead_asked = crate::watch::asking_stands();
         for (shadow, from, to) in &due {
             self.ahead.insert(std::sync::Arc::as_ptr(shadow) as usize, (*from, *to));
         }
@@ -9462,6 +9613,8 @@ impl Batch {
             return;
         }
         self.refresh_textures();
+        // What was gathered past an earlier copy, as it would be pending.
+        self.settle_skipped(None);
         self.index.clear();
         let end = dst + len;
         let touched = |r: &(std::sync::Arc<crate::shadow::Shadow>, usize, usize)| r.1 < end && dst < r.2;
@@ -9496,12 +9649,13 @@ impl Batch {
             self.refreshes = now;
             self.flush_pending();
         }
-        self.ahead.clear();
+        self.past_copy();
         self.textures.clear();
     }
 
     fn flush(&mut self) {
         self.refresh_textures();
+        self.settle_skipped(None);
         self.index.clear();
         // Those kept past copies ([`passes_keep`]) with the rest, first.
         if !self.kept.is_empty() {
@@ -12077,6 +12231,202 @@ mod refresh_tests {
         }
         assert!(kept > 0, "nothing was kept past a copy");
         println!("refreshes kept past copies, summed over the copies: {kept}");
+    }
+
+    /// `VICTORY_FEWER_PAST_COPIES` leaves out only refreshes that would copy
+    /// nothing (`super::fewer_past_copies`): two sets of copies of the same
+    /// title memory (write-watched and views, over one another, on page
+    /// lines or not, many small ones), each prepared through its own batch
+    /// in lockstep, one with the switch off and one with it on, through
+    /// submissions that bring spans up to date in front of their steps and
+    /// then mix refreshes (most inside those spans, some across them),
+    /// copies into title memory (into the copies' ranges or beside them;
+    /// as `Step::Copy` with `VICTORY_PASSES_KEEP` on and off, and as
+    /// `Step::Placed`), shader writes of a copy and steps that write title
+    /// memory where it is not known: after every submission both sets hold
+    /// the same bytes, all of each copy, and every range refreshed since the
+    /// submission's last write of title memory holds title memory. Fewer
+    /// refreshes are done with it on (counted).
+    #[test]
+    fn fewer_past_copies_copies_the_same_bytes() {
+        let mut random = Random(0xFE3E_B0A7_C0B1_E5u64);
+        const LEN: usize = 24 * PAGE;
+        let regions = [title(LEN, false), title(LEN, true)];
+        let source = memory(PAGE);
+        // SAFETY (all blocks): title memory and copies of the test's own,
+        // written by this thread and, in a flush, by the threads that
+        // refresh, which are done when it returns.
+        unsafe {
+            for &region in &regions {
+                std::ptr::write_bytes(region as *mut u8, 5, LEN);
+            }
+        }
+        let world = || -> Vec<(Arc<Shadow>, *mut u8)> {
+            let mut copies = Vec::new();
+            for &region in &regions {
+                for (from, to) in [
+                    (0, LEN),
+                    (100, LEN - 5000),
+                    (3 * PAGE + 777, 9 * PAGE + 10),
+                    (8 * PAGE, 8 * PAGE + 300),
+                    (PAGE, 20 * PAGE),
+                    (12 * PAGE, 13 * PAGE),
+                    (14 * PAGE + 64, 22 * PAGE),
+                ] {
+                    let data = memory(to - from);
+                    copies.push((Shadow::unbacked((region + from) as u64, data, (to - from) as u64, false), data));
+                }
+            }
+            for i in 0..(super::LOOK_WIDE + 40) {
+                let at = regions[0] + (i * 1531) % (LEN - 4096);
+                let data = memory(4096);
+                copies.push((Shadow::unbacked(at as u64, data, 4096, false), data));
+            }
+            copies
+        };
+        let (off, on) = (world(), world());
+        let byte = |at: usize| unsafe { (at as *const u8).read_volatile() };
+        let mut left_out = 0;
+        let _one = SUBMITTING.lock().unwrap_or_else(|e| e.into_inner());
+        for round in 0..300 {
+            for _ in 0..random.below(6) {
+                let at = regions[random.below(2)] + random.below(LEN - 64);
+                for i in 0..1 + random.below(60) {
+                    unsafe { ((at + i) as *mut u8).write_volatile(random.below(256) as u8) };
+                }
+            }
+            let asked: Vec<(usize, usize)> = off
+                .iter()
+                .filter(|c| !c.0.unwatched())
+                .map(|c| (c.0.span().0 as usize, (c.0.span().0 + c.0.span().1) as usize))
+                .collect();
+            crate::watch::ask_once(&asked);
+            let (mut old, mut new) = (Batch::default(), Batch::default());
+            // In front of the steps: a span of each of most copies.
+            let mut fronts: Vec<(usize, usize, usize)> = Vec::new();
+            for c in 0..off.len() {
+                if random.below(5) == 0 {
+                    continue;
+                }
+                let (start, len) = off[c].0.span();
+                let (start, len) = (start as usize, len as usize);
+                let from = if random.below(2) == 0 { 0 } else { random.below(len) };
+                let n = if random.below(2) == 0 { len - from } else { 1 + random.below(len - from) };
+                fronts.push((c, start + from, n));
+            }
+            let spans = |copies: &Vec<(Arc<Shadow>, *mut u8)>| -> Vec<(Arc<Shadow>, usize, usize)> {
+                fronts.iter().map(|&(c, at, n)| (copies[c].0.clone(), at, at + n)).collect()
+            };
+            old.refresh_spans(spans(&off), Vec::new());
+            new.refresh_spans(spans(&on), Vec::new());
+            let mut since: Vec<(usize, usize, usize)> = Vec::new();
+            for _ in 0..1 + random.below(40) {
+                match random.below(12) {
+                    0..=5 => {
+                        // Refreshes, most inside the spans in front.
+                        let all = random.below(8) == 0;
+                        let picks: Vec<(usize, usize, usize)> = if all {
+                            fronts.iter().filter(|f| f.0 >= 14).copied().collect()
+                        } else {
+                            (0..1 + random.below(6))
+                                .map(|_| {
+                                    if random.below(4) != 0 && !fronts.is_empty() {
+                                        let (c, at, n) = fronts[random.below(fronts.len())];
+                                        let from = at + random.below(n);
+                                        (c, from, 1 + random.below(at + n - from))
+                                    } else {
+                                        let c = random.below(off.len());
+                                        let (start, len) = off[c].0.span();
+                                        let (start, len) = (start as usize, len as usize);
+                                        let from = random.below(len);
+                                        (c, start + from, 1 + random.below(len - from))
+                                    }
+                                })
+                                .collect()
+                        };
+                        for (c, at, n) in picks {
+                            old.add(&off[c].0, at, n);
+                            new.add(&on[c].0, at, n);
+                            since.push((c, at, n));
+                        }
+                    }
+                    6..=8 => {
+                        // A copy into title memory: as `Step::Copy` (both
+                        // ways of `VICTORY_PASSES_KEEP`) or `Step::Placed`.
+                        let dst = regions[random.below(2)] + random.below(LEN - 4096);
+                        let most = if random.below(4) == 0 { 4096 } else { 64 };
+                        let len = 1 + random.below(most);
+                        unsafe {
+                            for i in 0..len {
+                                source.add(i).write(random.below(256) as u8);
+                            }
+                        }
+                        let how = random.below(3);
+                        for (fewer, batch) in [(false, &mut old), (true, &mut new)] {
+                            super::FEWER_PAST_COPIES_IN_TEST.set(Some(fewer));
+                            match how {
+                                0 => batch.title_copied(),
+                                k => {
+                                    super::PASSES_KEEP_IN_TEST.set(Some(k == 1));
+                                    batch.copy_written(dst, len);
+                                    super::PASSES_KEEP_IN_TEST.set(None);
+                                }
+                            }
+                        }
+                        super::FEWER_PAST_COPIES_IN_TEST.set(None);
+                        super::copy_mapped(dst as *mut u8, source, len, true);
+                        crate::watch::wrote(dst, len);
+                        since.clear();
+                    }
+                    9 => {
+                        // Shaders are given a copy.
+                        let c = random.below(off.len());
+                        old.flush_one(&off[c].0);
+                        new.flush_one(&on[c].0);
+                    }
+                    10 => {
+                        // Another step that writes title memory, where is
+                        // not known (`Step::Run`): it ends the asking.
+                        old.title_written();
+                        new.title_written();
+                        if random.below(2) == 0 {
+                            let at = regions[random.below(2)] + random.below(LEN - 64);
+                            for i in 0..1 + random.below(60) {
+                                unsafe { ((at + i) as *mut u8).write_volatile(random.below(256) as u8) };
+                            }
+                            crate::watch::ask_once_end();
+                        }
+                        since.clear();
+                    }
+                    _ => {
+                        // Nothing but a look at what is pending.
+                        assert!(old.skipped.is_empty(), "skipped with the switch off");
+                    }
+                }
+            }
+            old.flush();
+            new.flush();
+            assert!(new.skipped.is_empty() && new.refreshes.is_empty() && new.kept.is_empty());
+            crate::watch::ask_once_end();
+            left_out += new.left_out;
+            assert_eq!(old.left_out, 0);
+            for (i, (a, b)) in off.iter().zip(&on).enumerate() {
+                let len = a.0.span().1 as usize;
+                let (x, y) = unsafe { (std::slice::from_raw_parts(a.1, len), std::slice::from_raw_parts(b.1, len)) };
+                if let Some(at) = (0..len).find(|&k| x[k] != y[k]) {
+                    panic!("round {round}: copy {i} differs at {:#x} (off {} on {})", a.0.span().0 as usize + at, x[at], y[at]);
+                }
+            }
+            for &(c, at, n) in &since {
+                let start = on[c].0.span().0 as usize;
+                let same = unsafe {
+                    std::slice::from_raw_parts(at as *const u8, n) == std::slice::from_raw_parts(on[c].1.add(at - start), n)
+                };
+                assert!(same, "round {round}: {at:#x}+{n:#x} of copy {c} is not title memory; first byte {}", byte(at));
+            }
+        }
+        assert!(left_out > 0, "nothing was left out past a copy");
+        println!("refreshes left out past copies into title memory: {left_out}");
     }
 
     /// [`super::long_first`] puts the long ranges first, longest first, and
