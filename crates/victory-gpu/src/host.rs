@@ -4165,7 +4165,45 @@ fn read_backs(list: &HostList) {
     for back in &list.deferred().texture_backs {
         crate::texback::land(back);
     }
-    for (buffer, at, [row, rows, pitch]) in &list.deferred().backs {
+    buffer_backs(&list.deferred().backs);
+}
+
+/// [`read_backs`] of `lists`, a flight's in their order, on the thread that
+/// lands flights: the textures' on the landing threads at once
+/// ([`crate::texback::wide`]), then the buffers'. One after the other as
+/// [`read_backs`] when a buffer's read-back overlaps a texture's memory.
+fn flight_read_backs(lists: &[&HostList]) {
+    use crate::land;
+    let landing = std::time::Instant::now();
+    let deferred: Vec<std::sync::MutexGuard<'_, Deferred>> = lists.iter().map(|list| list.deferred()).collect();
+    let textures: Vec<&crate::texback::Back> = deferred.iter().flat_map(|d| d.texture_backs.iter()).collect();
+    let n = textures.len() as u64;
+    let apart = || {
+        let ranges: Vec<(usize, usize)> = textures.iter().map(|b| b.range()).collect();
+        deferred.iter().flat_map(|d| d.backs.iter()).all(|(_, at, [row, rows, pitch])| {
+            let end = at + rows.saturating_sub(1) * pitch + row;
+            *rows == 0 || ranges.iter().all(|&(from, to)| end <= from || to <= *at)
+        })
+    };
+    if n < 2 || !crate::texback::wide() || !apart() {
+        drop(deferred);
+        for list in lists {
+            read_backs(list);
+        }
+    } else {
+        crate::texback::land_wide(&textures);
+        land::count(land::stat::TEX_WIDE, n);
+        for d in &deferred {
+            buffer_backs(&d.backs);
+        }
+    }
+    land::count(land::stat::TEX_BACKS, n);
+    land::spent(land::stat::TEX_US, landing);
+}
+
+/// The buffers read back of a list that has run ([`read_backs`]).
+fn buffer_backs(backs: &[(ID3D12Resource, usize, [usize; 3])]) {
+    for (buffer, at, [row, rows, pitch]) in backs {
         let mut data = std::ptr::null_mut();
         // SAFETY: a read-back buffer of ours, written by the list that has
         // run; the title's destination holds every row (checked when the
@@ -5249,9 +5287,9 @@ impl Host {
             telling = match item {
                 Late::Run(mut flight) => {
                     last = flight.number;
-                    for &i in &flight.order {
-                        read_backs(flight.lists[i].host());
-                    }
+                    let lists: Vec<&HostList> = flight.order.iter().map(|&i| flight.lists[i].host()).collect();
+                    flight_read_backs(&lists);
+                    drop(lists);
                     if let Some(card) = flight.card {
                         self.card_done(card);
                     }

@@ -20,7 +20,7 @@
 //! before, as it would before the console's GPU has run.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, OnceLock, RwLock, Weak};
 
 use windows::Win32::Graphics::Direct3D12::*;
 
@@ -66,12 +66,15 @@ struct Ticket {
     valid: AtomicBool,
 }
 
-static TICKETS: Mutex<Vec<Weak<Ticket>>> = Mutex::new(Vec::new());
+/// Landings ([`land`]) hold it shared, several at once on the landing
+/// threads ([`wide`]); a change of a mapping or resource marks tickets under
+/// it alone, so that none lands across that change.
+static TICKETS: RwLock<Vec<Weak<Ticket>>> = RwLock::new(Vec::new());
 static TRACKING: AtomicBool = AtomicBool::new(false);
 
 fn track(owner: usize, at: usize, end: usize) -> Arc<Ticket> {
     let ticket = Arc::new(Ticket { owner, at, end, valid: AtomicBool::new(true) });
-    let mut tickets = TICKETS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut tickets = TICKETS.write().unwrap_or_else(|e| e.into_inner());
     tickets.retain(|weak| weak.strong_count() != 0);
     tickets.push(Arc::downgrade(&ticket));
     TRACKING.store(true, Ordering::Relaxed);
@@ -82,7 +85,7 @@ fn invalidate(matches: impl Fn(&Ticket) -> bool) {
     if !TRACKING.load(Ordering::Relaxed) {
         return;
     }
-    TICKETS.lock().unwrap_or_else(|e| e.into_inner()).retain(|weak| {
+    TICKETS.write().unwrap_or_else(|e| e.into_inner()).retain(|weak| {
         let Some(ticket) = weak.upgrade() else { return false };
         if matches(&ticket) {
             ticket.valid.store(false, Ordering::Release);
@@ -202,7 +205,7 @@ pub(crate) fn land(back: &Back) {
     static COPIED: AtomicU64 = AtomicU64::new(0);
     static STALE: AtomicU64 = AtomicU64::new(0);
     let _mapping = crate::watch::title_memory_reading();
-    let _ticket_guard = TICKETS.lock().unwrap_or_else(|e| e.into_inner());
+    let _ticket_guard = TICKETS.read().unwrap_or_else(|e| e.into_inner());
     if !back.ticket.valid.load(Ordering::Acquire) {
         let skipped = STALE.fetch_add(1, Ordering::Relaxed) + 1;
         if skipped.is_power_of_two() {
@@ -249,6 +252,83 @@ pub(crate) fn land(back: &Back) {
 }
 
 
+/// Whether the relay lands a flight's texture read-backs on the landing
+/// threads, several at once (`VICTORY_RELAY_TEX_WIDE`; on, `=0`: one after
+/// the other on the thread that copies back, as before).
+///
+/// The ocean's passes write some thirteen textures of the kinds copied back
+/// a frame when the boat drives fast, mostly 256x256 floats; each landing
+/// reads the texture's title memory, tiles the texels into it and writes it
+/// through the kernel, under the lock against changes of mappings, all of
+/// it on the one thread that lands flights (runs r96, r98: the relay's
+/// "read-backs and lists" 4.5 ms a frame in the seconds under 29.5 fps,
+/// 12.8 texture read-backs a frame, against 1.1-1.9 ms and 1.5-3.9 in the
+/// fast ones: about 0.3 ms for each).
+///
+/// What lands is the same: the read-backs of textures whose title memory
+/// overlaps are landed one after the other in the lists' order on one
+/// thread ([`groups`]), the others touch no byte of each other's; all of a
+/// flight's are landed before what follows its read-backs (the plan done
+/// with, its bottom-of-pipe writes, fence signals), as before, and its
+/// buffer read-backs after them, in their order (when one of those overlaps
+/// a texture's memory, the flight's read-backs are landed one after the
+/// other as before).
+pub(crate) fn wide() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RELAY_TEX_WIDE").is_none_or(|v| v != "0"))
+}
+
+/// The read-backs of `ranges` (title memory `[at, end)`, in the order they
+/// land one after the other) in groups that share no byte with each other:
+/// those whose memory overlaps, directly or through others, in one group, in
+/// the order given.
+pub(crate) fn groups(ranges: &[(usize, usize)]) -> Vec<Vec<usize>> {
+    let mut order: Vec<usize> = (0..ranges.len()).collect();
+    order.sort_by_key(|&i| ranges[i].0);
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut end = 0;
+    for i in order {
+        let (at, to) = ranges[i];
+        match groups.last_mut() {
+            Some(group) if at < end => {
+                group.push(i);
+                end = end.max(to);
+            }
+            _ => {
+                groups.push(vec![i]);
+                end = to;
+            }
+        }
+    }
+    for group in &mut groups {
+        group.sort_unstable();
+    }
+    groups
+}
+
+/// Lands `backs` ([`land`]), given in the order they land one after the
+/// other: the groups of [`groups`] on the landing threads at once.
+pub(crate) fn land_wide(backs: &[&Back]) {
+    struct Shared<'a>(&'a [&'a Back]);
+    impl Shared<'_> {
+        fn get(&self, i: usize) -> &Back {
+            self.0[i]
+        }
+    }
+    // SAFETY: a back is only read (its buffer mapped and unmapped, which
+    // D3D12 allows on any thread, by one thread: each back is in one
+    // group); its ticket is atomic.
+    unsafe impl Sync for Shared<'_> {}
+    let ranges: Vec<(usize, usize)> = backs.iter().map(|b| b.range()).collect();
+    let groups = groups(&ranges);
+    let shared = Shared(backs);
+    crate::land::each(groups.len(), &|g| {
+        for &i in &groups[g] {
+            land(shared.get(i));
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,5 +349,88 @@ mod tests {
         released(93);
         assert!(!far.valid.load(Ordering::Acquire));
         assert!(track(94, 0x2000, 0x3000).valid.load(Ordering::Acquire));
+    }
+
+    /// Landing the groups at once, in any order, leaves memory as landing
+    /// every read-back one after the other does: overlapping ones stay in
+    /// one group in their order, and groups share no byte.
+    #[test]
+    fn wide_groups_land_the_same_bytes_as_one_after_the_other() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        for round in 0..500u32 {
+            let count = 1 + next(16) as usize;
+            let backs: Vec<(usize, usize, u8)> = (0..count)
+                .map(|i| {
+                    let at = next(4096) as usize;
+                    let len = next(if round % 3 == 0 { 64 } else { 1024 }) as usize;
+                    (at, at + len, (i as u8).wrapping_mul(37).wrapping_add(round as u8) | 1)
+                })
+                .collect();
+            // As a landing: what is there read, the texels put over a part
+            // of it, the whole written back.
+            let land = |memory: &mut [u8], (at, end, value): (usize, usize, u8)| {
+                let mut tiled = memory[at..end].to_vec();
+                for (k, byte) in tiled.iter_mut().enumerate() {
+                    if k % 5 != 4 {
+                        *byte = value.wrapping_add(k as u8);
+                    }
+                }
+                memory[at..end].copy_from_slice(&tiled);
+            };
+            let mut one_after_the_other = vec![0u8; 8192];
+            for &back in &backs {
+                land(&mut one_after_the_other, back);
+            }
+            let ranges: Vec<(usize, usize)> = backs.iter().map(|b| (b.0, b.1)).collect();
+            let groups = groups(&ranges);
+            let mut all: Vec<usize> = groups.iter().flatten().copied().collect();
+            all.sort_unstable();
+            assert_eq!(all, (0..count).collect::<Vec<_>>(), "every read-back once");
+            for (a, first) in groups.iter().enumerate() {
+                assert!(first.windows(2).all(|w| w[0] < w[1]), "a group keeps the order given");
+                for second in &groups[a + 1..] {
+                    for &i in first {
+                        for &j in second {
+                            let (x, y) = (ranges[i], ranges[j]);
+                            assert!(x.1 <= y.0 || y.1 <= x.0 || x.0 == x.1 || y.0 == y.1, "groups share no byte");
+                        }
+                    }
+                }
+            }
+            // The groups at once on threads of their own, each in memory
+            // as it was before them, what each landed put together; and
+            // the groups one after the other in reverse.
+            let memory = std::sync::Mutex::new(vec![0u8; 8192]);
+            std::thread::scope(|scope| {
+                for group in &groups {
+                    let (memory, backs, land) = (&memory, &backs, &land);
+                    scope.spawn(move || {
+                        let mut own = vec![0u8; 8192];
+                        for &i in group {
+                            land(&mut own, backs[i]);
+                        }
+                        let mut memory = memory.lock().unwrap();
+                        for &i in group {
+                            let (at, end, _) = backs[i];
+                            memory[at..end].copy_from_slice(&own[at..end]);
+                        }
+                    });
+                }
+            });
+            assert_eq!(memory.into_inner().unwrap(), one_after_the_other, "round {round}: {backs:?}");
+            let mut reversed = vec![0u8; 8192];
+            for group in groups.iter().rev() {
+                for &i in group {
+                    land(&mut reversed, backs[i]);
+                }
+            }
+            assert_eq!(reversed, one_after_the_other, "round {round}: {backs:?}");
+        }
     }
 }

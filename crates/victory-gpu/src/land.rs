@@ -115,7 +115,13 @@ pub(crate) mod stat {
     pub(crate) const HAD_BYTES: usize = 24;
     /// Jobs.
     pub(crate) const JOBS: usize = 25;
-    pub(crate) const COUNT: usize = 26;
+    /// Textures read back (`crate::texback`) landed, those of them landed
+    /// on the landing threads at once (`VICTORY_RELAY_TEX_WIDE`), and the
+    /// microseconds of the flights' read-backs, the buffers' with them.
+    pub(crate) const TEX_BACKS: usize = 26;
+    pub(crate) const TEX_WIDE: usize = 27;
+    pub(crate) const TEX_US: usize = 28;
+    pub(crate) const COUNT: usize = 29;
 }
 
 static STATS: [AtomicU64; stat::COUNT] = [const { AtomicU64::new(0) }; stat::COUNT];
@@ -193,6 +199,15 @@ pub(crate) fn log(frames: f64) {
         mb(s[stat::HAD_BYTES]),
         u8::from(skip_on()),
     );
+    if s[stat::TEX_BACKS] > 0.0 {
+        tracing::info!(
+            "texture read-backs landed per frame by the relay: {:.1}, {:.1} of them on the landing threads at once              (VICTORY_RELAY_TEX_WIDE={}); the flights' read-backs {:.2} ms (of \"read-backs and lists\")",
+            s[stat::TEX_BACKS],
+            s[stat::TEX_WIDE],
+            u8::from(crate::texback::wide()),
+            ms(stat::TEX_US),
+        );
+    }
 }
 
 /// Threads kept for landing, and the work they are at.
