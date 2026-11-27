@@ -546,6 +546,12 @@ fn bury_lag() -> u64 {
 /// numbers come in order, but for threads that overtake each other: one of
 /// those is dropped a little later than it could be.
 fn bury(finished: u64) {
+    bury_with(finished, drop);
+}
+
+/// [`bury`], the objects due given to `release` (taken out of the list
+/// under its lock, released outside it).
+fn bury_with(finished: u64, release: impl FnOnce(Vec<(u64, Retired)>)) {
     let finished = finished.saturating_sub(bury_lag());
     let done: Vec<(u64, Retired)> = {
         let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
@@ -555,7 +561,7 @@ fn bury(finished: u64) {
         }
         retired.drain(..n).collect()
     };
-    drop(done);
+    release(done);
 }
 
 /// Objects [`retire`] dropped at once (no submission was running) and
@@ -3989,6 +3995,7 @@ mod font;
 mod menu;
 mod panel;
 mod place;
+mod relay2;
 mod send;
 pub(crate) mod split_submit;
 pub(crate) use send::{goes_as_words, words_under};
@@ -5282,39 +5289,54 @@ impl Host {
         stage.next("landing: read-backs, telling the title");
         let mut last = 0;
         let mut landed = Vec::new();
-        let mut telling = std::time::Instant::now();
-        for item in items {
-            telling = match item {
-                Late::Run(mut flight) => {
+        let telling = std::cell::Cell::new(std::time::Instant::now());
+        // The flights tidied after all is told (`VICTORY_RELAY2_TELL_FIRST`).
+        relay2::tell_then_tidy(
+            items,
+            relay2::tell_first(),
+            |item| match item {
+                Late::Run(flight) => {
                     last = flight.number;
                     let lists: Vec<&HostList> = flight.order.iter().map(|&i| flight.lists[i].host()).collect();
                     flight_read_backs(&lists);
                     drop(lists);
-                    if let Some(card) = flight.card {
-                        self.card_done(card);
-                    }
-                    if let Some(own) = flight.own {
-                        own.landed();
-                    }
-                    for detached in &mut flight.lists {
-                        detached.release_tables();
-                    }
-                    landed.push((flight.lists, flight.order));
-                    crate::land::spent(crate::land::stat::READ_BACKS, telling)
+                    telling.set(crate::land::spent(crate::land::stat::READ_BACKS, telling.get()));
+                    Some(flight)
                 }
                 Late::Write(at, what, bytes) => {
                     what.write(at as *mut u8, bytes);
-                    crate::land::spent(crate::land::stat::TOLD, telling)
+                    telling.set(crate::land::spent(crate::land::stat::TOLD, telling.get()));
+                    None
                 }
                 Late::Signal(fence, value) => {
                     crate::fence::set(fence as crate::object::This, value);
-                    crate::land::spent(crate::land::stat::TOLD, telling)
+                    telling.set(crate::land::spent(crate::land::stat::TOLD, telling.get()));
+                    None
                 }
-            };
-        }
+            },
+            |mut flight: Flight| {
+                if let Some(card) = flight.card {
+                    self.card_done(card);
+                }
+                if let Some(own) = flight.own {
+                    own.landed();
+                }
+                for detached in &mut flight.lists {
+                    detached.release_tables();
+                }
+                landed.push((flight.lists, flight.order));
+                telling.set(crate::land::spent(crate::land::stat::READ_BACKS, telling.get()));
+            },
+        );
+        let telling = telling.get();
         if last > 0 {
             FINISHED.store(last, Ordering::Release);
-            bury(last);
+            // Released beside this thread (`VICTORY_RELAY2_BURY_ASIDE`).
+            if relay2::bury_aside() {
+                bury_with(last, relay2::drop_aside);
+            } else {
+                bury(last);
+            }
         }
         stage.next("landing: the rest");
         self.log_messages();
