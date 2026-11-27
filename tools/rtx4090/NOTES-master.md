@@ -151,3 +151,7 @@ global-lock hold each, ~5,800 a heavy frame): 29.1 fps mean, frames over 40 ms 1
 r69 (perf/passes: copies flush only the refreshes they touch, the join spins 250 us, textures biggest first): 29.1
 fps, over 50 ms 396, one 5-second hitch. r70 (+ `VICTORY_PASSES_HOT=1`, helpers awake through a submission):
 29.3 fps, over 50 ms 302, longest frame 145 ms (r68: 525), lowest fps line 19.6: on in the launcher.
+
+r71 (`VICTORY_TEXREF_PARTIAL`: textures detiled only in the rows whose bytes changed): 29.15 fps mean, over 50 ms
+300, longest 464 ms; preparing 18.7 ms (r70: 19.0): within noise of r70. Its shots reach the top-down view of the
+boat on open water: no black blocks with the water's tiled light left out (the default again); no texture faults.
