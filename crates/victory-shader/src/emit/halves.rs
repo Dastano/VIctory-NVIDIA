@@ -8,17 +8,15 @@ use std::collections::HashSet;
 use super::{Fields, Inst, Lower, Operand, Reg, Role, RootType, Source, Value};
 
 impl<'a> Lower<'a> {
-    /// Whether every use of `value`, a typed buffer load's result, reads
-    /// one 16-bit half of it as a half float: a `v_fma_mix*` source with
-    /// its `op_sel_hi` bit set, or `v_cvt_f32_f16`. A program that takes a
-    /// format load apart like that reads a 16-bit integer view on the
-    /// console (the load gives the zero-extended integer, whose bits are a
-    /// half; a float view's value it would not take apart). A use is a
-    /// read as an operand ([`crate::ir::operand_reads`]): a later write of
-    /// the register reads the value only to keep it in the lanes EXEC
-    /// leaves alone, and a phi carries it on, its own uses counting. False
-    /// without a use.
-    pub(super) fn read_only_as_halves(&self, value: Value) -> bool {
+    /// How `value`, a typed buffer load's channel, is read:
+    /// - `None`: read as something other than a 16-bit half float;
+    /// - `Some(false)`: unread;
+    /// - `Some(true)`: every read is a `v_fma_mix*` source with its `op_sel_hi`
+    ///   bit set, or `v_cvt_f32_f16`.
+    /// A program that takes a format load apart like that reads a 16-bit
+    /// integer view on the console (the load gives the zero-extended integer,
+    /// whose bits are a half; a float view's value it would not take apart).
+    fn half_use_kind(&self, value: Value) -> Option<bool> {
         let p = self.x.p;
         let mut used = false;
         let mut seen = HashSet::from([value]);
@@ -46,7 +44,7 @@ impl<'a> Lower<'a> {
                     }
                     used = true;
                     let Fields::Valu(v) = &i.fields else {
-                        return false;
+                        return None;
                     };
                     match i.name() {
                         "v_cvt_f32_f16" => {}
@@ -56,19 +54,20 @@ impl<'a> Lower<'a> {
                                     && v.opsel_hi >> k & 1 == 0
                             });
                             if whole {
-                                return false;
+                                return None;
                             }
                         }
-                        _ => return false,
+                        _ => return None,
                     }
                 }
             }
         }
-        used
+        Some(used)
     }
 
     /// Whether `inst` is a format load of whole dwords (not d16) whose
-    /// every channel is read only as halves ([`Self::read_only_as_halves`]).
+    /// used channels are read only as halves ([`Self::half_use_kind`]),
+    /// allowing unused channels (e.g. unread `.w`) without disqualifying it.
     pub(super) fn format_load_read_as_halves(&self, inst: &Inst) -> bool {
         let Fields::Buffer {
             data: Some(Operand::Vector { reg, .. }),
@@ -88,10 +87,18 @@ impl<'a> Lower<'a> {
             Some("xyzw") => 4,
             _ => return false,
         };
-        (0..count).all(|k| {
-            inst.write(Reg::V(reg + k))
-                .is_some_and(|v| self.read_only_as_halves(v))
-        })
+        let mut any_used = false;
+        for k in 0..count {
+            let Some(v) = inst.write(Reg::V(reg + k)) else {
+                return false;
+            };
+            match self.half_use_kind(v) {
+                None => return false,
+                Some(true) => any_used = true,
+                Some(false) => {}
+            }
+        }
+        any_used
     }
 
     /// The table places ([`Self::table_place`]) every access through which

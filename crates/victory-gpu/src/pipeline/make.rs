@@ -171,8 +171,8 @@ pub(crate) fn waiting() -> u64 {
 static VARIANTS: AtomicU64 = AtomicU64::new(0);
 
 /// Whether a draw into views of other formats than its pipeline declares
-/// gets a host pipeline for those formats ([`for_formats`]); on unless
-/// `VICTORY_TARGET_VARIANTS=0`.
+/// gets a host pipeline for those formats ([`for_formats`]); on by default
+/// (`VICTORY_TARGET_VARIANTS=0` turns it off).
 fn variants_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_TARGET_VARIANTS").is_none_or(|v| v != "0"))
@@ -203,7 +203,9 @@ fn variant<'a>(p: &'a Arc<Pending>, g: &GraphicsState, bound: &TargetFormats) ->
                 so_far,
                 "a pipeline is made again for the render target formats bound at its draw (VICTORY_TARGET_VARIANTS=0: the draw goes out with the title's pipeline)"
             );
-            Arc::new(Pending::new(p.shaders.clone(), Some(Box::new(g.with_formats(bound)))))
+            let made = Arc::new(Pending::new(p.shaders.clone(), Some(Box::new(g.with_formats(bound)))));
+            super::known::note(made.key(), &made.shaders, made.graphics.as_deref());
+            made
         });
         if next.formats == *bound {
             return next;

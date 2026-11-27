@@ -1,5 +1,11 @@
 # VIctory on NVIDIA
 
+## What this fork adds on top (soldier16 / RTX 5070 + i5-13600K)
+
+- **Native 1080p on Series S (`play-S-1080p.ps1`)**: `crates/victory-loader/src/hooks.rs` raises Series S's hardcoded 1,277 MiB render-target pool (`0x6186268`) to 2,199 MiB and its 297 MiB transient RT pool (`0x1d488b6`) to 710 MiB when `scale > 0.67`, eliminating the startup OOM breakpoint (`0x2219650` / `0x2473e88`).
+- **One-click pipeline warming (`scripts/warm-nvidia.ps1` + `scripts/nvidia-env.ps1`)**: `VICTORY_PIPELINE_BOOK=1` is enabled by default in `play-nvidia.ps1`, `variant()` pipelines are recorded, skipped RT hashes (`rt_off_hashes.txt`) are excluded from `warm`, and `warm-nvidia.ps1 -Used` warms pipelines with 100% matching launcher env flags.
+- **Release build & CPU/VRAM/shader fixes**: `play-nvidia.ps1` defaults to `-Build release` (`VICTORY_SKIP_PIPELINES` works without `diagnostics` overhead, `lto = "thin"`), `DynamicBits` 64-bit descriptor bitset, 64 KiB heap sync + batched `constant_slots`, overlapped `begin_sync_heaps()`, `Notes::flush()` batching, 180s `host-pipelines.bin` save throttle, `is_integer_or_const` NaN-scrub guard, `half_views` fast-path fix, dynamic 12 GB VRAM target budget, and hybrid CPU tuning (`VICTORY_FAST_CORES=1`, `VICTORY_WIDE_SPIN=80`, `VICTORY_CARD_BUFFERS_MIN_KB=64`, `VICTORY_WINDOWS_BAR_MB=256`).
+
 ## Built from many projects
 
 This repository did not come from one place. Over several weeks we built, ran
@@ -228,11 +234,13 @@ model 6.6 and mesh shaders, Rust (the toolchain is pinned), the MSVC build
 tools, and your own dump of the title.
 
 ```powershell
-git clone https://github.com/trustno1-coder/VIctory-NVIDIA
-cd VIctory-NVIDIA
+git clone https://github.com/soldier162/Victory-nvidia-soldier16
+cd Victory-nvidia-soldier16
 copy victory.example.toml victory.toml      # then set your paths, outside this folder
-cargo build --locked --profile diag -p victory --features diagnostics
-scripts\play-nvidia.ps1 -Exe <path of your copy's executable>
+cargo build --locked --release -p victory
+scripts\play-S-720p.ps1 -Exe <path of your copy's executable>
+# Optional: pre-warm used pipelines to eliminate shader-compile stutters
+scripts\warm-nvidia.ps1 -Used
 ```
 
 `scripts\play-nvidia.ps1` starts a copy of the build named `victory_sm.exe`, so
@@ -260,7 +268,7 @@ subtitles stay sharp either way. Series S outputs 1920x1080 and Series X
 
 | Script | Console | World drawn at | Render scale | Tested on the RTX 5070 |
 |---|---|---|---|---|
-| `play-S-1080p.ps1` | Series S | 1920x1080 | 1.0 | **crashes at start** (the title stops at a breakpoint; also reported on an RTX 2080) |
+| `play-S-1080p.ps1` | Series S | 1920x1080 | 1.0 | **works** (RT pools raised in `hooks.rs` to 2199 + 710 MiB) |
 | `play-S-720p.ps1` | Series S | 1280x720 | 0.667 | not yet |
 | `play-S-540p.ps1` | Series S | 960x540 | 0.5 | yes: the default, about 18-22 fps |
 | `play-S-480p.ps1` | Series S | 853x480 | 0.444 | not yet |

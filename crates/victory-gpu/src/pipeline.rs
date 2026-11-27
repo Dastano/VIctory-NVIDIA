@@ -60,6 +60,11 @@ pub(crate) struct Shader {
     pub(crate) stage: &'static str,
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
+    /// The same first 8 bytes as a big-endian integer for O(1) hash-set lookups.
+    hash_u64: u64,
+    /// The full 32-byte BLAKE3 hash of `container`, reused when noting pipelines.
+    #[cfg(windows)]
+    full_hash: [u8; 32],
     container: Vec<u8>,
     /// Its part in the stand-in for the indirect light.
     #[cfg(windows)]
@@ -110,9 +115,13 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
         .or_insert_with(|| {
             KEPT[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             KEPT[1].fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            let hash_bytes: [u8; 8] = full.as_bytes()[..8].try_into().unwrap();
             Arc::new(Shader {
                 stage,
                 hash: full.to_hex()[..16].to_owned(),
+                hash_u64: u64::from_be_bytes(hash_bytes),
+                #[cfg(windows)]
+                full_hash: *full.as_bytes(),
                 container: bytes.to_vec(),
                 #[cfg(windows)]
                 ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),
@@ -418,6 +427,10 @@ struct Pipeline {
     /// One of the ray-tracing structure builder's ([`Builder`]).
     #[cfg(windows)]
     builder: bool,
+    /// Whether any shader of this pipeline matches `VICTORY_SKIP_PIPELINES`,
+    /// precomputed once at creation for O(1) per-draw checks.
+    #[cfg(windows)]
+    skipped: bool,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -485,6 +498,9 @@ static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 /// Shader hashes as printed in the pipeline diagnostics.
 #[cfg(windows)]
 fn parse_skip_hashes(value: &str) -> Vec<String> {
+    if value.trim().eq_ignore_ascii_case("none") {
+        return Vec::new();
+    }
     value
         .split(',')
         .map(str::trim)
@@ -503,25 +519,40 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
         .collect()
 }
 
+/// Parses a comma-separated `VICTORY_SKIP_PIPELINES` list into 64-bit hash prefixes.
 #[cfg(windows)]
-fn skipped_shader(p: &Pipeline) -> Option<&str> {
-    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
-    let hashes = HASHES.get_or_init(|| {
+pub fn parse_skip_hashes_u64(value: &str) -> std::collections::HashSet<u64> {
+    parse_skip_hashes(value)
+        .into_iter()
+        .filter_map(|h| u64::from_str_radix(&h, 16).ok())
+        .collect()
+}
+
+#[cfg(windows)]
+fn skip_hash_set() -> &'static std::collections::HashSet<u64> {
+    static SET: OnceLock<std::collections::HashSet<u64>> = OnceLock::new();
+    SET.get_or_init(|| {
         let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
-        parse_skip_hashes(&value)
-    });
-    if hashes.is_empty() {
+        parse_skip_hashes_u64(&value)
+    })
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+fn skipped_shader(p: &Pipeline) -> Option<&str> {
+    if !p.skipped {
         return None;
     }
+    let set = skip_hash_set();
     p.shaders
         .iter()
-        .find(|shader| hashes.contains(&shader.hash))
+        .find(|shader| set.contains(&shader.hash_u64))
         .map(|shader| shader.hash.as_str())
 }
 
 #[cfg(windows)]
+#[inline]
 pub(crate) fn is_skipped(this: This) -> bool {
-    !this.is_null() && skipped_shader(pipeline(this)).is_some()
+    !this.is_null() && pipeline(this).skipped
 }
 
 /// Counts a draw or dispatch of `this` intentionally skipped or dropped
@@ -593,6 +624,11 @@ fn hand_out(
         b.pipelines.push(host.clone());
         b.whole = false;
     }
+    #[cfg(windows)]
+    let skipped = {
+        let set = skip_hash_set();
+        !set.is_empty() && shaders.iter().any(|s| set.contains(&s.hash_u64))
+    };
     let pipeline = Box::new(Pipeline {
         object: Object::new(&FUNCTIONS),
         packet: [0; 8],
@@ -600,6 +636,8 @@ fn hand_out(
         host,
         #[cfg(windows)]
         builder,
+        #[cfg(windows)]
+        skipped,
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });
@@ -800,15 +838,17 @@ pub fn use_pipeline_cache(dir: std::path::PathBuf) {
 /// Saves the pipeline cache now if anything was added (at the end of a run).
 #[cfg(windows)]
 pub fn save_pipeline_cache() {
+    known::flush();
     library::save(true);
 }
 
 #[cfg(test)]
 mod tests {
-    #[cfg(all(windows, feature = "diagnostics"))]
+    #[cfg(windows)]
     #[test]
     fn skip_hashes_accepts_full_hashes_only() {
         assert!(super::parse_skip_hashes(" , ").is_empty());
+        assert!(super::parse_skip_hashes("none").is_empty());
         assert_eq!(
             super::parse_skip_hashes(" 0123456789ABCDEF, 0123456789abcde, xyz, 0011223344556677,"),
             ["0123456789abcdef", "0011223344556677"]

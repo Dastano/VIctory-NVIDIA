@@ -179,6 +179,9 @@ pub struct Layout {
     /// Byte offsets inside a block for each coordinate, per axis.
     /// Empty for linear and unsupported modes.
     pattern: &'static SwizzlePattern,
+    /// Precomputed contiguous column copy runs per mip (empty for linear/unaddressable),
+    /// and the uniform chunk size of all body runs if every body run matches.
+    mip_runs: Vec<(Vec<(usize, usize, usize)>, Option<usize>)>,
 }
 
 type SwizzlePattern = [Vec<u32>; 3];
@@ -341,6 +344,7 @@ impl Layout {
             first_tail_mip: d.mips,
             mips,
             pattern: &EMPTY_PATTERN,
+            mip_runs: Vec::new(),
         }
     }
 
@@ -512,7 +516,7 @@ impl Layout {
         } else {
             &EMPTY_PATTERN
         };
-        Layout {
+        let mut layout = Layout {
             desc: d,
             block,
             thick,
@@ -523,7 +527,38 @@ impl Layout {
             first_tail_mip,
             mips,
             pattern,
+            mip_runs: Vec::new(),
+        };
+        if addressable {
+            let n = d.element_bytes as usize;
+            layout.mip_runs = layout
+                .mips
+                .iter()
+                .map(|m| {
+                    let bytes = m.width as usize * n;
+                    let mut runs = Vec::new();
+                    let mut first_linear = 0;
+                    let mut first_tiled = layout.column(m, 0) as usize;
+                    for x in 1..m.width {
+                        let offset = layout.column(m, x) as usize;
+                        let at = x as usize * n;
+                        if offset != first_tiled + (at - first_linear) {
+                            runs.push((first_tiled, first_linear, at - first_linear));
+                            first_tiled = offset;
+                            first_linear = at;
+                        }
+                    }
+                    runs.push((first_tiled, first_linear, bytes - first_linear));
+                    let (body, _) = runs.split_at(runs.len().saturating_sub(1));
+                    let chunk_size = body.first().map(|run| run.2).filter(|&size| {
+                        body.iter()
+                            .all(|&(offset, _, len)| len == size && offset.is_multiple_of(size))
+                    });
+                    (runs, chunk_size)
+                })
+                .collect();
         }
+        layout
     }
 
     /// Whether [`Layout::offset`] and the copies work for this layout:
@@ -708,30 +743,14 @@ impl Layout {
             return Err(Error::TooSmall);
         }
         let linear = self.desc.swizzle == Swizzle::LINEAR;
-        // The row and depth contribute one common base to every column, so
-        // the same contiguous runs repeat on every row, including mip tails.
-        let mut runs = Vec::new();
-        if !linear {
-            let mut first_linear = 0;
-            let mut first_tiled = self.column(m, 0) as usize;
-            for x in 1..m.width {
-                let offset = self.column(m, x) as usize;
-                let at = x as usize * n;
-                if offset != first_tiled + (at - first_linear) {
-                    runs.push((first_tiled, first_linear, at - first_linear));
-                    first_tiled = offset;
-                    first_linear = at;
-                }
-            }
-            runs.push((first_tiled, first_linear, bytes - first_linear));
-        }
-        // A mip can end partway through the last run. Check the other runs
-        // once so each row can copy them as fixed-size chunks.
+        // Precomputed contiguous column runs repeat on every row, including mip tails.
+        let (runs, chunk_size) = if linear {
+            (&[][..], None)
+        } else {
+            let cached = &self.mip_runs[mip as usize];
+            (cached.0.as_slice(), cached.1)
+        };
         let (body, last) = runs.split_at(runs.len().saturating_sub(1));
-        let chunk_size = body.first().map(|run| run.2).filter(|&size| {
-            body.iter()
-                .all(|&(offset, _, len)| len == size && offset.is_multiple_of(size))
-        });
         for z in 0..depth {
             let (s, inner) = self.split(first + z);
             let base = u64::from(s) * self.slice_size + m.offset;

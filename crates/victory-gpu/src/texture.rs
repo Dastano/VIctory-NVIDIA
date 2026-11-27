@@ -1165,6 +1165,15 @@ impl Staging {
         (self.memory as usize, self.read)
     }
 
+    /// Title memory range eligible for write-watch batching (`ask_once`),
+    /// skipping view-guarded and one-shot textures that cannot use `GetWriteWatch`.
+    pub(crate) fn watched_memory(&self) -> Option<(usize, usize)> {
+        if self.guard_view || self.read == 0 || self.once.load(std::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
+        Some((self.memory as usize, self.read))
+    }
+
     /// The title's level and the array slice of the staging buffer's part
     /// `i`.
     fn part(&self, i: usize) -> (u32, u32) {

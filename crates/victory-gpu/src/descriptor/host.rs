@@ -111,6 +111,126 @@ impl Made {
     }
 }
 
+/// Compact 64-bit bitset tracking taken dynamic descriptor slots (8x smaller
+/// than `Vec<bool>`, with word-level free-run scanning).
+struct DynamicBits {
+    words: Vec<u64>,
+    len: usize,
+}
+
+impl DynamicBits {
+    fn new(len: usize) -> Self {
+        let count = len.div_ceil(64);
+        let mut words = vec![0u64; count];
+        let rem = len & 63;
+        if rem != 0 {
+            words[count - 1] = !((1u64 << rem) - 1);
+        }
+        Self { words, len }
+    }
+
+    fn find_in_range(&self, start: usize, end: usize, n: usize) -> Option<usize> {
+        let mut pos = start;
+        let mut run = 0usize;
+        let mut run_start = start;
+        while pos < end {
+            let wi = pos >> 6;
+            let bit = pos & 63;
+            let w = self.words[wi] >> bit;
+            let avail = (64 - bit).min(end - pos);
+            if run == 0 {
+                if avail == 64 && w == u64::MAX {
+                    pos += 64;
+                    continue;
+                }
+                let skip = w.trailing_ones() as usize;
+                if skip >= avail {
+                    pos += avail;
+                    continue;
+                }
+                pos += skip;
+                run_start = pos;
+                let bit = pos & 63;
+                let w = self.words[wi] >> bit;
+                let rem = (64 - bit).min(end - pos);
+                let zeros = (w.trailing_zeros() as usize).min(rem);
+                if zeros >= n {
+                    return Some(run_start);
+                }
+                run = zeros;
+                pos += zeros;
+                if zeros < rem {
+                    run = 0;
+                    pos += 1;
+                }
+            } else {
+                if avail == 64 && w == 0 {
+                    run += 64;
+                    if run >= n {
+                        return Some(run_start);
+                    }
+                    pos += 64;
+                    continue;
+                }
+                let zeros = (w.trailing_zeros() as usize).min(avail);
+                run += zeros;
+                if run >= n {
+                    return Some(run_start);
+                }
+                pos += zeros;
+                if zeros < avail {
+                    run = 0;
+                    pos += 1;
+                }
+            }
+        }
+        None
+    }
+
+    fn find_run(&self, cursor: usize, n: usize) -> Option<usize> {
+        if n == 0 || n > self.len {
+            return None;
+        }
+        let second_end = cursor.saturating_add(n.saturating_sub(1)).min(self.len);
+        self.find_in_range(cursor, self.len, n)
+            .or_else(|| self.find_in_range(0, second_end, n))
+    }
+
+    fn set_range(&mut self, first: usize, n: usize) {
+        let mut pos = first;
+        let end = (first + n).min(self.len);
+        while pos < end {
+            let wi = pos >> 6;
+            let bit = pos & 63;
+            let take = (64 - bit).min(end - pos);
+            let mask = if take == 64 { u64::MAX } else { ((1u64 << take) - 1) << bit };
+            self.words[wi] |= mask;
+            pos += take;
+        }
+    }
+
+    fn clear_range(&mut self, first: usize, end: usize) -> u32 {
+        let mut pos = first;
+        let end = end.min(self.len);
+        let mut given = 0u32;
+        while pos < end {
+            let wi = pos >> 6;
+            let bit = pos & 63;
+            let take = (64 - bit).min(end - pos);
+            let mask = if take == 64 { u64::MAX } else { ((1u64 << take) - 1) << bit };
+            given += (self.words[wi] & mask).count_ones();
+            self.words[wi] &= !mask;
+            pos += take;
+        }
+        given
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn get(&self, idx: usize) -> Option<bool> {
+        (idx < self.len).then(|| (self.words[idx >> 6] >> (idx & 63)) & 1 != 0)
+    }
+}
+
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
@@ -157,7 +277,7 @@ pub(crate) struct HostHeap {
     kept: Box<[Mutex<Option<ID3D12Resource>>]>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
-    next: Mutex<(u32, Vec<bool>)>,
+    next: Mutex<(u32, DynamicBits)>,
     /// How many dynamic slots are free (changed under `next`'s lock): with
     /// fewer than a table needs, the search is not made. Once the world
     /// had taken them all, every later table of the frame searched every
@@ -1283,7 +1403,7 @@ pub(crate) fn slot_story(slot: u32) -> String {
         let mut text = if index < host.count {
             format!("title slot {index}, made from {}", host.describe_slot(index).unwrap_or_default())
         } else {
-            let taken = host.next.lock().unwrap_or_else(|e| e.into_inner()).1.get((index - host.count) as usize).copied();
+            let taken = host.next.lock().unwrap_or_else(|e| e.into_inner()).1.get((index - host.count) as usize);
             format!("dynamic slot {} (taken {taken:?})", index - host.count)
         };
         if twin {
@@ -1586,7 +1706,7 @@ impl HostHeap {
             waiting: Mutex::default(),
             away: Mutex::default(),
             kept: (0..count + extra).map(|_| Mutex::new(None)).collect(),
-            next: Mutex::new((0, vec![false; extra as usize])),
+            next: Mutex::new((0, DynamicBits::new(extra as usize))),
             free: std::sync::atomic::AtomicU32::new(extra),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
@@ -1705,31 +1825,16 @@ impl HostHeap {
         let (next, taken) = &mut *guard;
         let enough = self.free.load(std::sync::atomic::Ordering::Relaxed) >= n
             && n < self.too_long.load(std::sync::atomic::Ordering::Relaxed);
-        let n = n as usize;
-        // Search from `next` on, then from the start (extending past cursor by
-        // n - 1 so contiguous runs crossing the cursor are not missed).
-        let cursor = *next as usize;
+        let n_usize = n as usize;
         let end = self.dynamic as usize;
-        let second_end = cursor.saturating_add(n.saturating_sub(1)).min(end);
-        let starts = (cursor..end).chain(0..second_end);
-        let mut run = 0;
-        let mut found = None;
-        let mut last = usize::MAX;
-        for at in starts.take(if enough { usize::MAX } else { 0 }) {
-            // A run cannot wrap past the end.
-            if at != last.wrapping_add(1) {
-                run = 0;
-            }
-            last = at;
-            run = if taken[at] { 0 } else { run + 1 };
-            if run == n {
-                found = Some(at + 1 - n);
-                break;
-            }
-        }
+        let found = if enough {
+            taken.find_run(*next as usize, n_usize)
+        } else {
+            None
+        };
         let Some(first) = found else {
             if enough {
-                self.too_long.fetch_min(n as u32, std::sync::atomic::Ordering::Relaxed);
+                self.too_long.fetch_min(n, std::sync::atomic::Ordering::Relaxed);
             }
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
@@ -1743,9 +1848,9 @@ impl HostHeap {
         };
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
-        taken[first..first + n].fill(true);
-        self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
-        *next = ((first + n) % end) as u32;
+        taken.set_range(first, n_usize);
+        self.free.fetch_sub(n, std::sync::atomic::Ordering::Relaxed);
+        *next = ((first + n_usize) % end) as u32;
         Some(self.count + first as u32)
     }
 
@@ -1753,6 +1858,11 @@ impl HostHeap {
     /// when the host caps its size.
     pub(crate) fn count(&self) -> u32 {
         self.count
+    }
+
+    /// Dynamic slots available past [`Self::count`] on this heap.
+    pub(crate) fn dynamic_count(&self) -> u32 {
+        self.dynamic
     }
 
     /// The GPU address of the table of element strides by title slot (view
@@ -2586,11 +2696,10 @@ impl HostHeap {
         };
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let end = (at + n).min(self.dynamic) as usize;
-        if let Some(slots) = guard.1.get_mut(at as usize..end) {
-            let given = slots.iter().filter(|taken| **taken).count() as u32;
+        if (at as usize) < end {
+            let given = guard.1.clear_range(at as usize, end);
             self.free.fetch_add(given, std::sync::atomic::Ordering::Relaxed);
             self.too_long.store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
-            slots.fill(false);
         }
     }
 
@@ -2868,6 +2977,17 @@ impl HostHeap {
                 .CreateConstantBufferView(Some(&desc), self.at(index))
         };
         self.put(index);
+        if let Some((_, _, data)) = &self.strides
+            && index < victory_shader::emit::SLOT_STRIDES_COUNT
+        {
+            let entry = if victory_shader::emit::constant_marks() {
+                victory_shader::emit::SLOT_STRIDE_CONSTANT
+            } else {
+                0
+            };
+            // SAFETY: inside the mapping; atomic-sized dword write.
+            unsafe { (*data as *mut u32).add(index as usize).write_volatile(entry) };
+        }
         // A program that reads it as raw bytes reads its twin.
         let twin = self.twin(index).filter(|_| desc.SizeInBytes > 0);
         if let Some(twin) = twin {
