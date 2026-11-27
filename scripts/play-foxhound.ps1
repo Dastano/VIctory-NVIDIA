@@ -97,6 +97,8 @@ $settings = @{
     VICTORY_PASSES_HOT = '1'
     # A frame's texture pass runs at most 8 ms in all; the rest waits a frame (RTX 4090 r84: 47.0 fps walking uncapped, r82: 39.4)
     VICTORY_TEXSPK_PASS_MS = '8'
+    # Relay round 2 off: boat drive r100 (on) 32.4 fps / 44 dips, r101 (off) 33.5 / 37
+    VICTORY_RELAY2_BURY_ASIDE = '0'; VICTORY_RELAY2_TELL_FIRST = '0'
     # Descriptor heaps' records
     VICTORY_HEAP_SYNC_FIRST = '1'; VICTORY_SYNC_IN_PLACE = '1'; VICTORY_SPANS_QUICK = '1'; VICTORY_SYNC_FINE = '1'
     VICTORY_HEAP_SYNC_AT_SUBMIT = '1'
