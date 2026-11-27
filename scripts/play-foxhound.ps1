@@ -29,8 +29,9 @@ param(
     # driver how many this card does and gives no more).
     [ValidateRange(2, 6)][int]$FrameGenX = 2,
     # Frame generation is made ready at every start with Streamline, on or off, so that the F1 menu switches it
-    # and changes its amount while playing. -NoFrameGenReady: only with -FrameGen, as before.
-    [switch]$NoFrameGenReady,
+    # and changes its amount while playing, with -FrameGenReady. Without it, only with -FrameGen: made ready but
+    # off it cost about 1 fps walking on an RTX 4090 (tools/rtx4090/NOTES-master.md, r49/r50).
+    [switch]$FrameGenReady,
     # Frames begin every 1/Fps s whatever the title asks (it asks 1/30). 1000, the default: no cap, a frame
     # begins as soon as the last is done. 30: the title's own rate.
     [ValidateRange(1, 1000)][int]$Fps = 1000,
@@ -102,7 +103,7 @@ if ($Dlss -ne 'off') {
     if (Test-Path (Join-Path $sl 'sl.interposer.dll')) {
         $settings.VICTORY_DLSS = '1'; $settings.VICTORY_DLSS_MODE = $Dlss; $settings.VICTORY_STREAMLINE_DIR = $sl
         if ($FrameGen) { $settings.VICTORY_FRAMEGEN = '1'; $settings.VICTORY_FRAMEGEN_X = [string]$timesWanted }
-        elseif (-not $NoFrameGenReady) { $settings.VICTORY_FRAMEGEN = '1'; $settings.VICTORY_FRAMEGEN_X = '0' }   # ready, off
+        elseif ($FrameGenReady) { $settings.VICTORY_FRAMEGEN = '1'; $settings.VICTORY_FRAMEGEN_X = '0' }   # ready, off
         # Frame generation takes 1.5 to 2 GB of the card's memory, which the layer otherwise fills with textures up
         # to nine tenths of its budget (on a 12 GB card it then ran out: no generated frames). On from the start, it
         # is left a fifth of the budget; ready but off, a little less is held back.
@@ -128,7 +129,7 @@ $settings.VICTORY_MENU_FRAMEGEN = if ($settings.VICTORY_FRAMEGEN -eq '1') { [str
 $settings.VICTORY_MENU_FPS = [string]$fpsWanted
 $settings.VICTORY_MENU_FILE = $menuFile
 $settings.VICTORY_MENU_PLAY = $MyInvocation.MyCommand.Path
-$settings.VICTORY_MENU_ARGS = "-Exe '$($Exe -replace "'", "''")' -Build $Build$(if ($NoFrameGenReady) { ' -NoFrameGenReady' })"
+$settings.VICTORY_MENU_ARGS = "-Exe '$($Exe -replace "'", "''")' -Build $Build$(if ($FrameGenReady) { ' -FrameGenReady' })"
 
 $victory = Join-Path $repo "target\$Build\victory.exe"
 if (-not (Test-Path $victory)) {
