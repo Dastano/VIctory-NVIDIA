@@ -113,6 +113,84 @@ const BETWEEN: u64 = 4 << 20;
 /// The most steps of a submission done this way.
 const MOST: usize = 12288;
 
+/// Where places begin in the buffer between: a constant buffer view's
+/// alignment. What lies from a place's end to the next such boundary is no
+/// place's.
+const PLACE_ALIGN: u64 = 256;
+
+/// Whether the places read into the buffer between are copied in runs
+/// (`VICTORY_HEAVY_CARD_RUNS`, on by default; `0`: one copy for each place,
+/// as before): a place that follows the one before it in the same host copy
+/// as it follows it in the buffer between (at the next boundary there, with
+/// the same gap in both) is copied by the same `CopyBufferRegion`
+/// ([`join_reads`]).
+///
+/// Why: the fills of constant buffers read the title's ring of constants,
+/// a new place of it for each draw, one after the other. With 6,000-7,000
+/// draws a frame (the crowded common room of the first mission, run r59)
+/// that was as many copies recorded into our list, a call into the driver
+/// each and as many small copies on the card, and the planning of the steps
+/// done on the card took 6-7 ms of the submitting thread a frame (1-2 ms
+/// with fewer than 3,000 draws), the part of its work that grew most.
+///
+/// Why the bytes are the same: every place gets the same bytes from the
+/// same place of the same host copy as before, and the reads of a level
+/// still come before its writes, the levels in their order. What a joined
+/// copy writes besides is the gap after a place up to the next boundary:
+/// no place lies there (places begin at boundaries, one after another), no
+/// step's bytes are taken from it, and it held whatever an earlier
+/// submission left there. Its source lies between two places of the same
+/// host copy, inside its buffer.
+fn joined_reads() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAVY_CARD_RUNS").is_none_or(|v| v != "0"))
+}
+
+/// `reads` (source, host copy by address, offset in the source, offset in
+/// the buffer between, bytes), in their order, each read joined to the one
+/// before it if it reads the same host copy and follows it in both by the
+/// same gap, the one in the buffer between up to that one's next
+/// [`PLACE_ALIGN`] boundary ([`joined_reads`]).
+fn join_reads<T: Copy>(reads: Vec<(T, usize, u64, u64, u64)>) -> Vec<(T, u64, u64, u64)> {
+    let mut out: Vec<(T, usize, u64, u64, u64)> = Vec::with_capacity(reads.len());
+    for read in reads {
+        let (_, shadow, offset, at, len) = read;
+        if let Some(last) = out.last_mut() {
+            let (end, source_end) = (last.3 + last.4, last.2 + last.4);
+            if last.1 == shadow && at == end.next_multiple_of(PLACE_ALIGN) && offset >= source_end && offset - source_end == at - end {
+                last.4 = at + len - last.3;
+                continue;
+            }
+        }
+        out.push(read);
+    }
+    out.into_iter().map(|(source, _, offset, at, len)| (source, offset, at, len)).collect()
+}
+
+/// Since the last frame-rate line, the planning of steps done on the card
+/// ([`Host::card_steps`]), nanoseconds: choosing them, finding what holds
+/// their bytes, recording our list, the fills' slots, the steps taken noted.
+static PLAN_PARTS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// Since the last frame-rate line: places read into the buffer between,
+/// and the copies that read them.
+static PLAN_COPIES: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Counts into [`PLAN_PARTS`].
+struct Parts(std::cell::Cell<std::time::Instant>);
+
+impl Parts {
+    fn begin() -> Parts {
+        Parts(std::cell::Cell::new(std::time::Instant::now()))
+    }
+
+    /// What came since the last part was part `i`.
+    fn part(&self, i: usize) {
+        let now = std::time::Instant::now();
+        PLAN_PARTS[i].fetch_add((now - self.0.replace(now)).as_nanos() as u64, Ordering::Relaxed);
+    }
+}
+
 /// How a fill's bytes get where its list reads them, if the card brings
 /// them.
 #[derive(Clone)]
@@ -862,8 +940,10 @@ impl Host {
 
     fn take_steps(&self, written: &[(usize, usize)], runs: &[&HostList]) -> Result<Option<Taken>, &'static str> {
         let mut spent = crate::timeline::span("steps on the card: chosen");
+        let timed = Parts::begin();
         let (does, steps) = does_of(written, runs);
         let chosen = plan(&does, stage(), placed_order(), &mut None)?;
+        timed.part(0);
         if chosen.is_empty() {
             return Ok(None);
         }
@@ -925,7 +1005,7 @@ impl Host {
                         return Err("not all of what it reads is mapped");
                     }
                     let at = end;
-                    end = (end + len as u64).next_multiple_of(256);
+                    end = (end + len as u64).next_multiple_of(PLACE_ALIGN);
                     places.insert(place, at);
                     at
                 }
@@ -970,6 +1050,7 @@ impl Host {
                 to,
             });
         }
+        timed.part(1);
         spent.next("steps on the card: the list");
         let Some(own) = self.own_list() else {
             return Err("no host list or buffer for it");
@@ -1002,14 +1083,17 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         own.list.note_op(|| format!("{} copies of title memory done on the card, {end} bytes (VICTORY_CARD_STEPS)", ops.len()));
         let levels = ops.iter().map(|op| op.level).max().unwrap_or(0);
+        let joined = joined_reads();
+        let (mut read_places, mut read_copies) = (0u64, 0u64);
         for level in 0..=levels {
             let mut reads = Vec::new();
             let mut writes = Vec::new();
             for op in ops.iter().filter(|op| op.level == level) {
                 let len = op.len as u64;
-                let read = (&op.from.0.buffer, op.from.0.offset(op.from.1 as u64), op.at, len);
+                let shadow = Arc::as_ptr(&op.from.0) as usize;
+                let read = (&op.from.0.buffer, shadow, op.from.0.offset(op.from.1 as u64), op.at, len);
                 // (Each place once.)
-                if places.remove(&(Arc::as_ptr(&op.from.0) as usize, op.from.1, op.len, level)).is_some() {
+                if places.remove(&(shadow, op.from.1, op.len, level)).is_some() {
                     reads.push(read);
                 }
                 match &op.to {
@@ -1018,11 +1102,21 @@ impl Host {
                     To::Slot(..) => {}
                 }
             }
+            read_places += reads.len() as u64;
+            let reads = if joined {
+                join_reads(reads)
+            } else {
+                reads.into_iter().map(|(buffer, _, offset, at, len)| (buffer, offset, at, len)).collect()
+            };
+            read_copies += reads.len() as u64;
             record(level == 0, &own.list.list, &own.between, &reads, &writes);
         }
+        PLAN_COPIES[0].fetch_add(read_places, Ordering::Relaxed);
+        PLAN_COPIES[1].fetch_add(read_copies, Ordering::Relaxed);
         own.list.close();
         // SAFETY: a live buffer.
         let gpu = unsafe { own.between.GetGPUVirtualAddress() };
+        timed.part(2);
         spent.next("steps on the card: the slots");
         // (11,000 slots a frame in a street, two descriptors each: on
         // several threads, a slot always on the same one, in the steps'
@@ -1040,6 +1134,7 @@ impl Host {
                 mine.for_each(|(heap, index, at, len)| crate::descriptor::constant_slot(heap, index, &own.between, at, len));
             }
         });
+        timed.part(3);
         let copies = ops.iter().filter(|op| matches!(op.to, To::Copy(..))).count();
         DONE[0].fetch_add((ops.len() - copies) as u64, Ordering::Relaxed);
         DONE[1].fetch_add(copies as u64, Ordering::Relaxed);
@@ -1047,11 +1142,13 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         noted(&ops);
         spent.end();
-        Ok(Some(Taken {
+        let taken = Taken {
             own,
             steps: chosen.iter().map(|&(i, _)| steps[i]).collect(),
             copied,
-        }))
+        };
+        timed.part(4);
+        Ok(Some(taken))
     }
 
     /// A list of ours open for recording, and its buffer.
@@ -1121,6 +1218,23 @@ pub(super) fn log(frames: f64) {
         d[2] / 1024.0,
         d[3],
     );
+    let ms: [f64; 5] = std::array::from_fn(|i| PLAN_PARTS[i].swap(0, Ordering::Relaxed) as f64 / 1e6 / frames);
+    let copies: [f64; 2] = std::array::from_fn(|i| PLAN_COPIES[i].swap(0, Ordering::Relaxed) as f64 / frames);
+    if ms.iter().sum::<f64>() > 0.0 {
+        tracing::info!(
+            "steps done on the card, their planning per frame, the submitting thread: {:.2} ms choosing them, {:.2} finding \
+             what holds their bytes, {:.2} recording our list ({:.0} places read into the buffer between in {:.0} copies, \
+             VICTORY_HEAVY_CARD_RUNS is {}), {:.2} making the fills' slots, {:.2} noting what was taken",
+            ms[0],
+            ms[1],
+            ms[2],
+            copies[0],
+            copies[1],
+            if joined_reads() { "on" } else { "off" },
+            ms[3],
+            ms[4],
+        );
+    }
     #[cfg(feature = "diagnostics")]
     {
         let noted = NOTED.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
@@ -1147,6 +1261,55 @@ pub(super) fn log(frames: f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Places of a host copy that follow one another as they do in the
+    /// buffer between are read by one copy, gap and all; any other step
+    /// between them keeps its own, and what each place is given is the
+    /// same bytes of the same host copy as one copy each gave it.
+    #[test]
+    fn places_that_follow_one_another_are_read_in_runs() {
+        // (source, host copy, offset, at, bytes): the ring of constants,
+        // 480 bytes every 512, laid at 256 boundaries in the buffer between.
+        let ring: Vec<_> = (0..4u64).map(|i| ('a', 1, 0x1000 + i * 512, i * 512, 480)).collect();
+        assert_eq!(join_reads(ring.clone()), [('a', 0x1000, 0, 512 * 3 + 480)]);
+        // A place that does not follow (another gap in the source, another
+        // host copy, out of order, beyond the next boundary) stands alone.
+        let mut reads = ring[..2].to_vec();
+        reads.push(('a', 1, 0x1000 + 2 * 512 + 16, 1024, 480));
+        reads.push(('b', 2, 0x1000 + 3 * 512 + 16, 1536, 480));
+        reads.push(('b', 2, 0x1000 + 4 * 512 + 16, 2048 + 256, 480));
+        reads.push(('b', 2, 0x0, 3072, 480));
+        assert_eq!(
+            join_reads(reads.clone()),
+            [
+                ('a', 0x1000, 0, 512 + 480),
+                ('a', 0x1000 + 2 * 512 + 16, 1024, 480),
+                ('b', 0x1000 + 3 * 512 + 16, 1536, 480),
+                ('b', 0x1000 + 4 * 512 + 16, 2048 + 256, 480),
+                ('b', 0x0, 3072, 480),
+            ]
+        );
+        // Every place's bytes come from where they came from alone, and no
+        // copy writes into another place.
+        for reads in [ring, reads] {
+            let joined = join_reads(reads.clone());
+            for &(source, _, offset, at, len) in &reads {
+                let by = joined.iter().filter(|j| j.2 <= at && at + len <= j.2 + j.3).collect::<Vec<_>>();
+                assert_eq!(by.len(), 1);
+                assert_eq!((by[0].0, by[0].1 + (at - by[0].2)), (source, offset));
+            }
+            for j in &joined {
+                for &(_, _, _, at, len) in &reads {
+                    let inside = j.2 <= at && at + len <= j.2 + j.3;
+                    let apart = at + len <= j.2 || j.2 + j.3 <= at;
+                    assert!(inside || apart);
+                }
+            }
+        }
+        // Ends that meet a boundary: no gap.
+        let exact: Vec<_> = (0..3u64).map(|i| ('a', 1, i * 256, i * 256, 256)).collect();
+        assert_eq!(join_reads(exact), [('a', 0, 0, 768)]);
+    }
 
     fn copy(dst: usize, src: usize, len: usize, asked: bool) -> Does {
         Does::Copy { dst, src, len, asked }
@@ -1590,3 +1753,4 @@ mod tests {
         assert!(done >= 20, "only {done} copies were done on the card");
     }
 }
+
