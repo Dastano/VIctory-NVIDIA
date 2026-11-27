@@ -357,6 +357,9 @@ fn big(at: *mut u8, size: usize, made: bool) {
     if size < BIG {
         return;
     }
+    if made && size >= 64 << 20 {
+        name_big(size);
+    }
     for (place, bytes) in BIG_AT.iter().zip(&BIG_BYTES) {
         if made {
             if place.compare_exchange(0, at as usize, Relaxed, Relaxed).is_ok() {
@@ -369,6 +372,26 @@ fn big(at: *mut u8, size: usize, made: bool) {
             return;
         }
     }
+}
+
+thread_local! {
+    /// Set while [`name_big`] logs: what it allocates is not named again.
+    static NAMING_BIG: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Logs where a block of ours of 64 MB or more is made, for the first 24:
+/// the memory census lists their sizes alone (one of 401 MB in run leak3).
+fn name_big(size: usize) {
+    if NAMING_BIG.with(|n| n.replace(true)) {
+        return;
+    }
+    static NAMED: AtomicU64 = AtomicU64::new(0);
+    if NAMED.fetch_add(1, Relaxed) < 24 {
+        let trace = std::backtrace::Backtrace::force_capture();
+        tracing::info!(mb = size >> 20, "a block of ours of 64 MB or more made:
+{trace}");
+    }
+    NAMING_BIG.with(|n| n.set(false));
 }
 
 /// The sizes of our own big blocks alive, largest first, in MB.
