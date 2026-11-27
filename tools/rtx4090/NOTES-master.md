@@ -244,3 +244,12 @@ steps refused (2.0 vs 0.18 ms, peaks of 15), and the copy-back relay lands 13.8 
 vs 1,654: about half the extra frame time is real extra content.
 r91 (`VICTORY_SUBMIT_FRAMES=2`): 39.1 fps, 11 lines under 29.5: no change. r92 (`VICTORY_PORT_GUARD=0`,
 `VICTORY_FAULT_UNLOCKED=1`): 37.7 fps, 16 under 29.5: worse; port 6 stays.
+
+## Frame generation on the ASUS monitor (r93-r94)
+
+The 3440x1440 monitor is now on the RTX 4090 (59 Hz). r93: the window moved at 3440x1440 by a DPI-unaware
+script spanned two displays: 15 rendered / 30 shown again. r94 (1600x900 window inside the ASUS): 31 presents /
+62 frames shown a second once in the world, 28.5 rendered fps mean (34 of 92 lines under 29.5), over 50 ms 207.
+Frame generation shows at most the monitor's refresh: on 59 Hz it holds the rendered rate at ~30. Without it
+the build renders 38-47 fps. On this monitor: no frame generation for the most responsive game, frame generation
+for 60 shown at 30 rendered. Keep the game window fully on the 4090's monitor (F1 FULLSCREEN there).

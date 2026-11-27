@@ -49,3 +49,5 @@ water light on). Measurements: `NOTES-master.md`.
 - A black box on the water around floating objects was fixed in r88 (`VICTORY_WAVE64_WATER3`). Should one
   still appear, `VICTORY_WATER_LIGHT=0` (or F1 → WATER LIGHT off) removes it, with darker water.
 - Memory grows over long sessions; restart after about an hour.
+
+- Frame generation shows at most the monitor's refresh rate (59 Hz on the ASUS): it then renders ~30 fps. The window must lie fully on a display of the RTX 4090.
