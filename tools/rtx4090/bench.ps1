@@ -12,7 +12,9 @@ param(
     [int]$KeysUntil = 200,   # bis wann Enter gedrückt wird (Sekunden)
     [int]$ShotEvery = 30,
     [switch]$NoTurns,
-    [string]$Launcher = 'scripts\play-nvidia.ps1'
+    [string]$Launcher = 'scripts\play-nvidia.ps1',
+    [int]$Turns = 6,
+    [string]$MoreKeys = ''
 )
 $ErrorActionPreference = 'Continue'
 $out = "$env:USERPROFILE\vbench\$Label"
@@ -23,8 +25,9 @@ Start-Sleep 2
 # Enter alle 4 s von 15 bis 200 s (Startbildschirme, Kontoauswahl, Story starten)
 $keys = (15..([int]($KeysUntil / 4)) | ForEach-Object { "$($_ * 4):Enter" }) -join ','
 # Kamera drehen in der Spielszene (rechter Stick = J/L): ab 280 s alle 20 s je 4 s
-$turns = (0..6 | ForEach-Object { $s = 280 + 20 * $_; $k = if ($_ % 2) { 'J' } else { 'L' }; "$s-$($s + 4):$k" }) -join ','
+$turns = (0..$Turns | ForEach-Object { $s = 280 + 20 * $_; $k = if ($_ % 2) { 'J' } else { 'L' }; "$s-$($s + 4):$k" }) -join ','
 if (-not $NoTurns) { $keys = "$keys,$turns" }
+if ($MoreKeys) { $keys = "$keys,$MoreKeys" }
 $m = @{ VICTORY_KEYS = $keys; VICTORY_LOG = 'info' }
 foreach ($k in $More.Keys) { $m[$k] = $More[$k] }
 $moreText = ($m.GetEnumerator() | ForEach-Object { "'$($_.Key)'='$($_.Value)'" }) -join ';'
