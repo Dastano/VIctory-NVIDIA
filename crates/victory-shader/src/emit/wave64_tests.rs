@@ -933,3 +933,89 @@ fn lds_accesses_after_the_last_plain_write_need_no_meeting() {
     assert_eq!(unstable.iter().map(|x| x.0).collect::<Vec<_>>(), ["ds_read_b32"]);
     assert!(unordered[0].1 > 0x10, "the read after the barrier");
 }
+
+/// The water's tile programs (`water_shading:CS_TransmissionVolumetrics_Tiled` and
+/// `_Tiled_LocalLights`): the group's first thread stores an accumulator's starting value to an
+/// LDS dword after the per-pixel early returns, every thread still here folds its key in
+/// (`ds_min_u32`, starting from -1) and reads the result back. When the first thread has
+/// returned, the console folds into whatever the LDS held (another group's tile); on the host
+/// that was anything, and the tile came out dark. The dword is now stored -1 by every thread
+/// first ([`super::lds_init`]), and the minimum is that of the threads still here, as with
+/// the first thread running. The threads below s0 have returned (EXEC only, as in the
+/// programs' form without their skips). The water's groups are one console wave, without
+/// barriers, which takes waves of 32 or 64 lanes; WARP's are 4 lanes, so here two console
+/// waves with the barriers that then belong between, which WARP runs.
+#[test]
+fn an_accumulator_its_first_thread_skips_starts_from_its_identity() {
+    let words = [
+        0xBE8C_047E, // s_mov_b64 s[12:13], exec
+        0x7DA6_0000, // v_cmpx_le_u32 exec, s0, v0: the threads below s0 have returned
+        0xBE8E_047E, // s_mov_b64 s[14:15], exec
+        0x7DA4_0080, // v_cmpx_eq_u32 exec, 0, v0: the group's first thread
+        0x7E02_0280, // v_mov_b32 v1, 0: the dword's address
+        0x7E04_02C1, // v_mov_b32 v2, -1: the minimum's starting value
+        0xD834_0000,
+        0x0000_0201, // ds_write_b32 v1, v2
+        0xBEFE_040E, // s_mov_b64 exec, s[14:15]
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xBF8A_0000, // s_barrier
+        0x7E02_0280, // v_mov_b32 v1, 0: the address in every thread
+        0x1606_00A5, // v_mul_u32_u24 v3, 37, v0
+        0x3606_06FF,
+        0x0000_007F, // v_and_b32 v3, 0x7f, v3
+        0x4A06_06FF,
+        0x0000_03E8, // v_add_nc_u32 v3, 1000, v3: the thread's key
+        0xD81C_0000,
+        0x0000_0301, // ds_min_u32 v1, v3
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xBF8A_0000, // s_barrier
+        0xD8D8_0000,
+        0x0400_0001, // ds_read_b32 v4, v1
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x340A_0082, // v_lshlrev_b32 v5, 2, v0
+        0xE070_1000,
+        0x8002_0405, // buffer_store_dword v4, v5, s[8:11], 0 offen
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+    ];
+    let mut native = native_of(&words, true, 128);
+    if let StageIo::Cs(cs) = &mut native.io {
+        cs.rsrc2 |= 1 << 15; // 512 bytes of LDS
+    }
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    assert_eq!(super::lds_init::hoists(&p, 128), vec![(0, u32::MAX)]);
+    let shader = lowered_on(&native, &p, &HashSet::new(), 4).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let key = |t: u32| (t * 37 & 127) + 1000;
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(true) else {
+        eprintln!("no software adapter; not run");
+        return;
+    };
+    let (root, pso) = host.compute_pipeline(&shader).expect("WARP takes the program");
+    for s0 in [0u32, 1, 5, 63, 64, 100, 127] {
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            if let (RootType::Constants, 0, 0) = (u.root, u.slot, u.dword) {
+                ud[u.index as usize] = s0;
+            }
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(128)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+        let min = (s0..128).map(key).min().unwrap();
+        let want: Vec<u32> = (0..128).map(|t| if t >= s0 { min } else { 0 }).collect();
+        assert_eq!(&out[0][..128], &want[..], "threads below {s0} returned");
+    }
+}

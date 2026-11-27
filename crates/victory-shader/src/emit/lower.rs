@@ -2585,6 +2585,9 @@ impl<'a> Lower<'a> {
         if self.pairs.is_some() && self.s.lds_dwords > HOST_LDS_DWORDS {
             return Err(unsupported(0, "LDS for the console waves' meetings past the host's 32 KiB"));
         }
+        // Before anything else (and before the lanes past a count of threads leave): every
+        // thread is here.
+        self.hoist_lds_inits();
         if counted {
             // Before anything else, so that wave counts, reads of the first
             // lane and stores know only the lanes that run.
@@ -4598,6 +4601,33 @@ impl<'a> Lower<'a> {
                 (self.s.m.load(c, p0), self.s.m.load(c, p1))
             })
             .collect()
+    }
+
+    /// The LDS dwords a compute program sets up as accumulators from one thread
+    /// ([`super::lds_init::hoists`]), stored with their starting values by every thread first
+    /// thing, then a group barrier: every thread of the group is still here, before any other
+    /// LDS access (`VICTORY_WAVE64_FIX`).
+    fn hoist_lds_inits(&mut self) {
+        let StageIo::Cs(cs) = self.x.native.io else {
+            return;
+        };
+        // (not where barriers do not wait, `VICTORY_GROUP_SYNC=0`: a thread late to its early
+        // store would undo the others' atomics)
+        if self.s.mesh.is_some() || !super::lds_init::wave64_fix() || super::group_sync() == 0 {
+            return;
+        }
+        let inits = super::lds_init::hoists(self.x.p, cs.lds_bytes() / 4);
+        if inits.is_empty() {
+            return;
+        }
+        let e = self.s.entry;
+        let lds = self.s.lds();
+        for (dword, value) in inits {
+            let (at, k) = (self.s.m.i32(dword), self.s.m.i32(value));
+            let ptr = self.s.m.element(e, lds, at);
+            self.s.m.store(e, ptr, k);
+        }
+        self.group_sync(e);
     }
 
     /// A group barrier with an LDS fence in `block`.

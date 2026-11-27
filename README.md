@@ -139,9 +139,12 @@ speed, in the picture and in simply being able to play it:
 - **Open water without dark blocks.** Two of the title's water light programs
   run on 32-lane cards only in a form that left whole tiles of the sea dark
   (around boats, along shores, under bridges) and cost about 15 ms of the
-  card a frame. They are left out there: no blocks and 30 fps instead of 25
-  on the first boat ride (RTX 5070), with water that is darker and bluer.
-  WATER LIGHT in the menu (`VICTORY_WATER_LIGHT=1`) runs them again.
+  card a frame. The blocks were tiles whose corner pixel is not water (that
+  thread set up the tile's LDS start values after its early return); the
+  translator now sets them up in every thread (`VICTORY_WAVE64_FIX`, on by
+  default), and the programs run again. WATER LIGHT in the menu
+  (`VICTORY_WATER_LIGHT=0`) leaves them out: about 5 fps more on the first
+  boat ride (RTX 5070), with water that is darker and bluer.
 - **One command to play**: the launcher builds the layer the first time and
   applies what the menu saved.
 - **`Get-NVIDIA-DLSS.cmd`**: the eight NVIDIA files that are loaded, about
