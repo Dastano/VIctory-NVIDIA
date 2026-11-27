@@ -2519,6 +2519,41 @@ struct Deferred {
     /// indirect arguments; 0 if none. It stays readable until the next
     /// clamp into it ([`HostList::indirect_state`]).
     indirect_readable: usize,
+    /// With [`split_submit::on`]: what `copies` say of host copies, made
+    /// when the list was closed ([`HostList::close`]); good while `copies`
+    /// has as many steps as it was made of ([`summary_of`]).
+    summary: Option<split_submit::Summary<std::sync::Arc<crate::shadow::Shadow>>>,
+}
+
+/// A host copy's key in the summaries ([`split_submit`]): its address, as
+/// everywhere else.
+fn shadow_key(shadow: &std::sync::Arc<crate::shadow::Shadow>) -> usize {
+    std::sync::Arc::as_ptr(shadow) as usize
+}
+
+/// A step as [`split_submit::Summary`] sees it.
+fn seen_of(step: &Step) -> split_submit::Seen<'_, std::sync::Arc<crate::shadow::Shadow>> {
+    match step {
+        Step::Refresh(shadow, address, len) => split_submit::Seen::Refresh(shadow, *address, *len),
+        Step::GpuWrite(shadow, address, len) => split_submit::Seen::Write(shadow, *address, *len),
+        _ => split_submit::Seen::Other,
+    }
+}
+
+/// The summary of `deferred`'s steps, if one was made of all of them.
+fn summary_of(deferred: &Deferred) -> Option<&split_submit::Summary<std::sync::Arc<crate::shadow::Shadow>>> {
+    deferred.summary.as_ref().filter(|s| s.steps == deferred.copies.len())
+}
+
+/// The summary of `deferred`'s steps: the one made at the close, or made now.
+fn with_summary<R>(
+    deferred: &Deferred,
+    f: impl FnOnce(&split_submit::Summary<std::sync::Arc<crate::shadow::Shadow>>) -> R,
+) -> R {
+    match summary_of(deferred) {
+        Some(summary) => f(summary),
+        None => f(&split_submit::Summary::of(deferred.copies.len(), deferred.copies.iter().map(seen_of), shadow_key)),
+    }
 }
 
 impl Deferred {
@@ -3955,6 +3990,7 @@ mod menu;
 mod panel;
 mod place;
 mod send;
+pub(crate) mod split_submit;
 pub(crate) use send::{goes_as_words, words_under};
 #[cfg(feature = "diagnostics")]
 pub(crate) mod spans;
@@ -4070,6 +4106,15 @@ fn declare_once() -> bool {
 /// The ranges the shaders of `runs` may write, per host copy, as declared.
 /// One list's lock at a time: a submission may name a list twice.
 fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
+    // The lists' summaries, made when they were closed: the same ranges in
+    // the same order ([`split_submit`]).
+    if split_submit::on() {
+        let mut declaring = split_submit::Declaring::default();
+        for list in runs {
+            with_summary(&list.deferred(), |summary| declaring.list(&summary.declared, shadow_key));
+        }
+        return declaring.done();
+    }
     let mut back: Vec<Declared> = Vec::new();
     // Where each copy is in it, and the ranges seen: dispatches declare the
     // same ranges thousands of times a frame.
@@ -5515,8 +5560,14 @@ impl Host {
             LINE_MOVED.notify_one();
         }
         drop(submitted);
-        let _landing = crate::timeline::span("landed lists reset and given back");
-        land();
+        if split_submit::on() {
+            // On a thread of its own: nothing of the next submission's
+            // preparing depends on it ([`split_submit`]).
+            split_submit::land_beside();
+        } else {
+            let _landing = crate::timeline::span("landed lists reset and given back");
+            land();
+        }
         AFTER_SEND.fetch_add(after.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
 
@@ -6622,6 +6673,12 @@ impl HostList {
             fail(format_args!(
                 "a host command list did not close ({e}): a command recorded into it was invalid"
             ));
+        }
+        // On the closing thread, not the submitting one (`VICTORY_SPLIT_SUBMIT`).
+        if split_submit::on() {
+            let mut deferred = self.deferred();
+            let summary = split_submit::Summary::of(deferred.copies.len(), deferred.copies.iter().map(seen_of), shadow_key);
+            deferred.summary = Some(summary);
         }
     }
 
@@ -8935,6 +8992,16 @@ impl Batch {
     fn copy_spans(&mut self, runs: &[&HostList]) {
         self.spans.clear();
         self.spans_at.clear();
+        // The lists' summaries, made when they were closed: the same spans
+        // in the same order ([`split_submit`]).
+        if split_submit::on() {
+            for list in runs {
+                with_summary(&list.deferred(), |summary| {
+                    split_submit::add_spans(&mut self.spans, &mut self.spans_at, &summary.spans, shadow_key);
+                });
+            }
+            return;
+        }
         // (Most come several times on end.)
         let mut last = (0, 0);
         for list in runs {
