@@ -82,6 +82,8 @@ $settings = @{
     # The write guards' lock shared by faults and refreshes, a claim per 64 KiB block (renderer port 6, from
     # Victory-Lap; RTX 4090 run r38: 28.3 -> 29.7 fps in the jail scene)
     VICTORY_PORT_GUARD = '1'
+    # Refresh helpers kept awake through a submission (RTX 4090 r70: longest frame 145 ms walking, r68: 525 ms)
+    VICTORY_PASSES_HOT = '1'
     # Descriptor heaps' records
     VICTORY_HEAP_SYNC_FIRST = '1'; VICTORY_SYNC_IN_PLACE = '1'; VICTORY_SPANS_QUICK = '1'; VICTORY_SYNC_FINE = '1'
     VICTORY_HEAP_SYNC_AT_SUBMIT = '1'
