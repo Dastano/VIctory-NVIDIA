@@ -85,3 +85,23 @@ thread does 27 ms a frame at the window and 30-39 ms in the common room (lists' 
 refreshes 7-10 ms where over 90 % of ~7,000-11,000 refreshes copy nothing; planning card steps 3-6 ms; waits for
 the submission lock and flights up to 5 ms). Holding 30 fps while walking through the crowd needs that work
 cut (the refresh design), not a switch.
+
+## trustno1-coder/VIctory-NVIDIA merged (DualSense, F1 menu, F3 panel), refresh skip (r49-r51)
+
+trustno1's fork moved onto the foxhound base; its main (661 commits: DualSense/DualSense Edge over HID, USB or
+Bluetooth, on by default as `VICTORY_DUALSENSE` auto; F1 settings menu; frame generation 2x-6x; F3 stats;
+window/input fixes; open water) merges into master with conflicts only in README and the launcher.
+`VICTORY_REFRESH_SKIP` (perf/refresh): the "copies nothing" check by binary search over the asked ranges and
+on the submitting thread before a flush wakes helpers; on by default (`=0`: as before).
+
+Same walking route as r47, `-Fps 30`:
+
+| Run | Build / launcher | fps mean / lowest line | frames over 40 ms | longest |
+|---|---|---|---|---|
+| r47 | master before the merge | 28.8 / 8.7 | 1,301 | 572 ms |
+| r49 | + trustno1 (frame generation made ready at every start) | 27.7 / 2.5 | 1,735 | 1,119 ms |
+| r50 | r49 with `-NoFrameGenReady` | 28.7 / 11.8 | 1,406 | 557 ms |
+| r51 | r50 + `VICTORY_REFRESH_SKIP` | 28.9 / 16.9 | 1,320 | 341 ms |
+
+So the launcher now makes frame generation ready only with `-FrameGen` (or `-FrameGenReady` for the F1 menu's
+live switch). trustno1's launcher defaults to `-Fps 1000` (no cap); `-Fps 30` holds the title's own rate.
