@@ -334,6 +334,84 @@ fn join_reads<T: Copy>(reads: Vec<(T, usize, u64, u64, u64)>) -> Vec<(T, u64, u6
     out.into_iter().map(|(source, _, offset, at, len)| (source, offset, at, len)).collect()
 }
 
+/// Whether the places read into the buffer between are laid out there by
+/// host copy and title address instead of in the order the steps first
+/// read them (`VICTORY_CARD_RUNS_SORTED`, on by default; `0`: in that
+/// order, as before): the places of a level that read the same host copy
+/// near one another ([`RUN_GAP`] bytes at most between them, a multiple of
+/// [`PLACE_ALIGN`] apart) lie as far apart in the buffer between as in the
+/// host copy, and are read by one `CopyBufferRegion` ([`lay_out`]).
+///
+/// Why: in the boat drive (run r105) the planning of the steps done on the
+/// card cost the submitting thread 3.2 ms a frame in the slow seconds (1.7
+/// in the fast ones), the largest part of it recording our list (0.95 ms):
+/// some 1,600 places a frame read in as many copies, [`joined_reads`]
+/// joining next to none of them (585,397 places in 584,309 copies), as the
+/// steps read their places mixed between host copies (a draw's constants
+/// from several rings) and not one after another. The slots of the fills
+/// (0.65 ms) were no longer the largest part.
+///
+/// Why the bytes are the same: every place still gets the bytes of the same
+/// place of the same host copy at the same level, before that level's
+/// writes, at a [`PLACE_ALIGN`] boundary of the buffer between; what a run
+/// copies besides lies in the gaps between its places in the host copy
+/// (inside its buffer, between two of its places) and goes to the gaps
+/// between them in the buffer between, where no place lies and from where
+/// no step takes bytes (places that overlap in the host copy overlap the
+/// same way, with the same bytes). If the gaps take the buffer between
+/// beyond [`BETWEEN`], the places are laid in their order as before.
+fn sorted_runs() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_RUNS_SORTED").is_none_or(|v| v != "0"))
+}
+
+/// The most bytes between two places of a run ([`sorted_runs`]): what the
+/// card copies besides is cheaper than a copy recorded more.
+const RUN_GAP: u64 = 4096;
+
+/// Where `places` (host copy by address, title address, bytes, level) lie
+/// in the buffer between ([`sorted_runs`]): their offsets, in their order,
+/// the runs that read them (the place whose host copy and address a run
+/// begins at, offset in the buffer between, bytes), by level, and the bytes
+/// of the buffer between used. With `sorted` off each place is a run of its
+/// own, laid in their order.
+fn lay_out(places: &[(usize, usize, usize, u32)], sorted: bool) -> (Vec<u64>, Vec<(usize, u64, u64)>, u64) {
+    let mut ats = vec![0u64; places.len()];
+    let mut runs: Vec<(usize, u64, u64)> = Vec::new();
+    let mut end = 0u64;
+    let mut order: Vec<usize> = (0..places.len()).collect();
+    if sorted {
+        order.sort_unstable_by_key(|&i| {
+            let (shadow, src, len, level) = places[i];
+            (level, shadow, src, std::cmp::Reverse(len))
+        });
+    }
+    // The run open: its first place, where it starts in the buffer between,
+    // and its end in the title's addresses.
+    let mut open: Option<(usize, u64, u64)> = None;
+    for i in order {
+        let (shadow, src, len, level) = places[i];
+        let (src, len) = (src as u64, len as u64);
+        if let Some((first, base, run_end)) = &mut open {
+            let (s0, a0, _, l0) = places[*first];
+            let a0 = a0 as u64;
+            if sorted && s0 == shadow && l0 == level && (src - a0) % PLACE_ALIGN == 0 && src <= *run_end + RUN_GAP {
+                ats[i] = *base + (src - a0);
+                *run_end = (*run_end).max(src + len);
+                runs.last_mut().expect("an open run").2 = *run_end - a0;
+                end = end.max(*base + (*run_end - a0));
+                continue;
+            }
+        }
+        let base = end.next_multiple_of(PLACE_ALIGN);
+        ats[i] = base;
+        runs.push((i, base, len));
+        end = base + len;
+        open = Some((i, base, src + len));
+    }
+    (ats, runs, end)
+}
+
 /// Since the last frame-rate line, the planning of steps done on the card
 /// ([`Host::card_steps`]), nanoseconds: choosing them, finding what holds
 /// their bytes, recording our list, the fills' slots, the steps taken noted.
@@ -1173,6 +1251,10 @@ impl Host {
         let mut held: HashMap<(usize, usize), Arc<Shadow>> = HashMap::default();
         let mut room = HashMap::default();
         let mut end = 0u64;
+        // With [`sorted_runs`]: the places in the order first read (and
+        // their host copies), `at` their number until they are laid out.
+        let sorted = sorted_runs();
+        let mut listed: Vec<((usize, usize, usize, u32), Arc<Shadow>)> = Vec::new();
         for (n, &(i, level)) in chosen.iter().enumerate() {
             let Some(((src, _), (dst, _))) = reads_writes(&does[i]) else {
                 continue;
@@ -1197,6 +1279,15 @@ impl Host {
             let place = (Arc::as_ptr(&from) as usize, src, len, level);
             let at = match places.get(&place) {
                 Some(&at) => at,
+                None if sorted => {
+                    if !mapped(src, src + len, &mut room) {
+                        return Err("not all of what it reads is mapped");
+                    }
+                    let at = listed.len() as u64;
+                    listed.push((place, from.clone()));
+                    places.insert(place, at);
+                    at
+                }
                 None => {
                     if end + len as u64 > BETWEEN {
                         return Err("too much at once");
@@ -1250,6 +1341,28 @@ impl Host {
                 to,
             });
         }
+        // The runs that read the places ([`lay_out`]), with [`sorted_runs`].
+        let mut runs_read: Vec<(u32, usize, u64, u64)> = Vec::new();
+        if sorted {
+            let keys: Vec<_> = listed.iter().map(|(place, _)| *place).collect();
+            let (mut ats, mut runs, mut used) = lay_out(&keys, true);
+            if used > BETWEEN {
+                (ats, runs, used) = lay_out(&keys, false);
+            }
+            if used > BETWEEN {
+                return Err("too much at once");
+            }
+            for op in &mut ops {
+                op.at = ats[op.at as usize];
+            }
+            runs_read = runs.into_iter().map(|(first, at, len)| (keys[first].3, first, at, len)).collect();
+            // (What the note of the list tells, with diagnostics.)
+            #[cfg(feature = "diagnostics")]
+            {
+                end = used;
+            }
+            let _ = used;
+        }
         timed.part(1);
         spent.next("steps on the card: the list");
         let Some(own) = self.own_list() else {
@@ -1288,12 +1401,16 @@ impl Host {
         for level in 0..=levels {
             let mut reads = Vec::new();
             let mut writes = Vec::new();
+            for &(_, first, at, len) in runs_read.iter().filter(|run| run.0 == level) {
+                let ((shadow, src, ..), from) = &listed[first];
+                reads.push((&from.buffer, *shadow, from.offset(*src as u64), at, len));
+            }
             for op in ops.iter().filter(|op| op.level == level) {
                 let len = op.len as u64;
                 let shadow = Arc::as_ptr(&op.from.0) as usize;
                 let read = (&op.from.0.buffer, shadow, op.from.0.offset(op.from.1 as u64), op.at, len);
                 // (Each place once.)
-                if places.remove(&(shadow, op.from.1, op.len, level)).is_some() {
+                if !sorted && places.remove(&(shadow, op.from.1, op.len, level)).is_some() {
                     reads.push(read);
                 }
                 match &op.to {
@@ -1302,7 +1419,7 @@ impl Host {
                     To::Slot(..) => {}
                 }
             }
-            read_places += reads.len() as u64;
+            read_places += if sorted { listed.iter().filter(|(place, _)| place.3 == level).count() } else { reads.len() } as u64;
             let reads = if joined {
                 join_reads(reads)
             } else {
@@ -1483,6 +1600,72 @@ mod tests {
     /// buffer between are read by one copy, gap and all; any other step
     /// between them keeps its own, and what each place is given is the
     /// same bytes of the same host copy as one copy each gave it.
+    /// Places laid out by host copy and address ([`sorted_runs`]): each is
+    /// given the bytes of its own place of its own host copy at its level,
+    /// at a boundary; a run's bytes besides fall where no place lies; the
+    /// places read mixed between host copies take a run per host copy; and
+    /// in their order they lie where they always did.
+    #[test]
+    fn places_by_host_copy_are_read_in_runs() {
+        // Two rings read in turn (a draw's constants from each), a place of
+        // a third host copy read twice, a place inside another, one far off,
+        // one off the boundaries, and the same places again at level 1.
+        let mut places = Vec::new();
+        for i in 0..6usize {
+            places.push((1, 0x10000 + i * 512, 480, 0));
+            places.push((2, 0x40000 + i * 256, 256, 0));
+        }
+        places.push((3, 0x9000, 64, 0));
+        places.push((1, 0x10000 + 512, 128, 0));
+        places.push((1, 0x10000 + 6 * 512 + 64 * 1024, 256, 0));
+        places.push((2, 0x40000 + 6 * 256 + 16, 256, 0));
+        places.push((1, 0x10000, 480, 1));
+        places.push((2, 0x40000, 256, 1));
+        let (ats, runs, end) = lay_out(&places, true);
+        assert_eq!(runs.len(), 7);
+        let mut seen = std::collections::HashSet::new();
+        for (i, &(shadow, src, len, level)) in places.iter().enumerate() {
+            let at = ats[i];
+            assert_eq!(at % PLACE_ALIGN, 0);
+            assert!(at + len as u64 <= end);
+            // The one run that writes it, at its level, reads it from its place.
+            let by: Vec<_> = runs.iter().filter(|r| r.1 <= at && at < r.1 + r.2).collect();
+            assert_eq!(by.len(), 1);
+            let &(first, base, bytes) = by[0];
+            let (s0, a0, _, l0) = places[first];
+            assert_eq!((s0, l0), (shadow, level));
+            assert_eq!(a0 as u64 + (at - base), src as u64);
+            assert!(at + len as u64 <= base + bytes);
+            // Two places on the same bytes of the buffer between are the
+            // same bytes of the same host copy.
+            for (j, &(s1, src1, len1, l1)) in places.iter().enumerate() {
+                let (b, e) = (ats[j], ats[j] + len1 as u64);
+                if b < at + len as u64 && at < e {
+                    assert_eq!((s1, l1), (shadow, level));
+                    assert_eq!(src1 as i64 - src as i64, b as i64 - at as i64);
+                }
+            }
+            seen.insert((shadow, level));
+        }
+        // No two runs share bytes.
+        for (k, a) in runs.iter().enumerate() {
+            for b in &runs[k + 1..] {
+                assert!(a.1 + a.2 <= b.1 || b.1 + b.2 <= a.1);
+            }
+        }
+        // In their order: one run each, where the order put them before.
+        let (ats, runs, end) = lay_out(&places, false);
+        assert_eq!(runs.len(), places.len());
+        let mut was = 0u64;
+        for (i, &(.., len, _)) in places.iter().enumerate() {
+            assert_eq!(ats[i], was);
+            assert_eq!(runs[i], (i, was, len as u64));
+            was = (was + len as u64).next_multiple_of(PLACE_ALIGN);
+        }
+        assert_eq!(end.next_multiple_of(PLACE_ALIGN), was);
+        assert_eq!(seen.len(), 5);
+    }
+
     #[test]
     fn places_that_follow_one_another_are_read_in_runs() {
         // (source, host copy, offset, at, bytes): the ring of constants,
