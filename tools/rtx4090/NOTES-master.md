@@ -308,3 +308,12 @@ r106 (1-3 fps apart) are within that spread; a change needs several runs a side 
 r108/r109 (boat drive, `VICTORY_CARD_ALL=1`: every title buffer's copy gets a card side, changes found on the
 card): 33.9 / 34.1 fps, 42 / 34 lines under 29.5 - inside the spread of the same build without it (r105/r107:
 33.5-35.4 fps, 21-37 lines): no effect; left off.
+
+## Redesign stage 1: frozen copies (r110-r112)
+
+`VICTORY_FREEZE=1` (REDESIGN.md stages 0-1, d8744d6, off by default), three boat runs: 33.4 / 34.9 / 33.9 fps,
+45 / 25 / 27 lines under 29.5 - inside the spread without it (r105/r107: 33.5-35.4, 21-37). Its counters: 49-64
+frozen copies looked at per frame, 470-846 of ~7,000 refreshes not recorded: few copies stay unwritten for 30
+frames, so the premise (most no-op refreshes belong to idle copies) does not hold; the no-op refreshes are of
+copies the title keeps touching a little. Stage 1 stays off. Stage 2 (the constant ring as CPU-only) targets
+card-step planning and card sends instead and stays a candidate.
