@@ -1,4 +1,4 @@
-# Starts your own copy of the title on foxhound with the settings tested on an RTX 4070 SUPER (Series X profile,
+﻿# Starts your own copy of the title on foxhound with the settings tested on an RTX 4070 SUPER (Series X profile,
 # 2560x1440 output, DLSS Quality when NVIDIA Streamline is set up).
 #
 #   .\scripts\play-foxhound.ps1 -Exe 'D:\MyDump\game_scarlett_master.exe'
@@ -23,7 +23,12 @@ param(
     [switch]$FrameGen,
     # Frames begin every 1/Fps s whatever the title asks (it asks 1/30); the frame time is the layer's limit.
     [ValidateRange(1, 1000)][int]$Fps = 0,
-    [hashtable]$More = @{}
+    [hashtable]$More = @{},
+    # Instead of playing: translate the shaders (-Shaders) and/or make the pipelines ahead (-Warm; -Used: only
+    # those earlier runs drew with), with exactly the switches a run with the same options sets.
+    [switch]$Shaders,
+    [switch]$Warm,
+    [switch]$Used
 )
 $repo = Split-Path $PSScriptRoot -Parent
 $settings = @{
@@ -41,6 +46,9 @@ $settings = @{
     VICTORY_TEXTURE_STAGE_MS = '16'; VICTORY_LEVELS_ON_DEMAND = '0'
     VICTORY_PRELUDE_UPLOADS = '1'; VICTORY_SHOW_NEW_LATER = '1'; VICTORY_POOL_SMALL = '0'; VICTORY_TABLED_REREAD = '1'
     VICTORY_QUEUE_HOST_TEXTURES = '0'
+    # The write guards' lock shared by faults and refreshes, a claim per 64 KiB block (renderer port 6, from
+    # Victory-Lap; RTX 4090 run r38: 28.3 -> 29.7 fps in the jail scene)
+    VICTORY_PORT_GUARD = '1'
     # Descriptor heaps' records
     VICTORY_HEAP_SYNC_FIRST = '1'; VICTORY_SYNC_IN_PLACE = '1'; VICTORY_SPANS_QUICK = '1'; VICTORY_SYNC_FINE = '1'
     VICTORY_HEAP_SYNC_AT_SUBMIT = '1'
@@ -78,6 +86,15 @@ $paths = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DAT
 Get-ChildItem Env:VICTORY_* -ErrorAction SilentlyContinue | Where-Object { $_.Name -notin $paths } | ForEach-Object { Remove-Item "Env:$($_.Name)" }
 foreach ($k in $settings.Keys) { Set-Item "Env:$k" $settings[$k] }
 
+if ($Shaders -or $Warm) {
+    $env:VICTORY_HOST_WAVE = '32'
+    Push-Location $repo
+    try {
+        if ($Shaders) { & $victory shaders }
+        if ($Warm) { if ($Used) { & $victory warm --used } else { & $victory warm } }
+    } finally { Pop-Location }
+    return
+}
 $logs = Join-Path $env:LOCALAPPDATA 'victory\logs'; New-Item -ItemType Directory -Force $logs | Out-Null
 $log = Join-Path $logs ('foxhound-{0:yyyyMMdd-HHmmss}.log' -f (Get-Date))
 $writer = [IO.StreamWriter]::new($log, $false, [Text.UTF8Encoding]::new($false)); $writer.AutoFlush = $true
