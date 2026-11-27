@@ -114,7 +114,11 @@ if ($Dlss -ne 'off') {
         Write-Host "repository folder fetches them from NVIDIA once (about 70 MB); VICTORY_STREAMLINE_DIR names another folder."
     }
 }
-if ($fpsWanted -gt 0) { $settings.VICTORY_FRAME_INTERVAL_US = [string][int][math]::Round(1000000 / $fpsWanted) }
+# With frame generation the interval paces the frames shown, rendered and generated alike: -Fps 30 with 2x gave
+# 15 rendered and 30 shown (RTX 4090 run r58). So -Fps counts rendered frames: the interval is divided by the
+# frames shown for each rendered one (2x on an RTX 40; the layer gives no more than the card does).
+$shownPer = if ($settings.VICTORY_FRAMEGEN -eq '1' -and [int]$settings.VICTORY_FRAMEGEN_X -ge 2) { [int]$settings.VICTORY_FRAMEGEN_X } else { 1 }
+if ($fpsWanted -gt 0) { $settings.VICTORY_FRAME_INTERVAL_US = [string][int][math]::Round(1000000 / ($fpsWanted * $shownPer)) }
 foreach ($k in $menu.Keys) {
     if ($k -like 'VICTORY_MENU_*') { continue }
     if ($menu[$k]) { $settings[$k] = $menu[$k] } else { $settings.Remove($k) }

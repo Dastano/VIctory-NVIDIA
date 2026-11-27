@@ -109,3 +109,17 @@ live switch). trustno1's launcher defaults to `-Fps 1000` (no cap); `-Fps 30` ho
 | r52 | final master, `-Fps 1000` (no cap), at the window | 33.6 / 31.6 (last 2 min) | - | - |
 
 The launcher default is `-Fps 30` here (most even frame times); `-Fps 1000` uncaps.
+
+## DLAA, frame generation pacing, the water (r56-r60)
+
+| Run | Build / setup (walking route) | rendered fps mean | frames over 50 ms | note |
+|---|---|---|---|---|
+| r56 | master + `VICTORY_WATCH_FAST` (then default on), DLAA + FG 2x | 3.3 | – | the write-watch askings took 264-267 ms a frame: the switch is now off by default |
+| r58 | DLAA + FG 2x, `-Fps 30` | 14.0 (28 shown) | 7,998 | the interval paced the frames shown, rendered and generated alike |
+| r59 | DLAA, no FG | 28.8 | 405 | DLAA costs nothing here (the CPU sets the frame); r47 with DLSS Q: 642 |
+| r60 | DLAA + FG 2x, launcher fix (`-Fps` counts rendered frames) | 27.3 (~55 shown) | 203 | |
+
+The F1 menu's WATER LIGHT (`VICTORY_WATER_LIGHT=1`) runs the water's two tiled light programs in the wave-wide
+form on 32-lane waves, which leaves whole tiles of open water black; off by default. Memory (r56): private bytes
+9.9 GB at the start, ~35 GB after three minutes in the world, flat for the rest of the 11 minutes; a 50-minute play
+session reached 59 GB (commit 84 of 89 GB, heavy paging), so it grows with places visited.
