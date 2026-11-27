@@ -214,3 +214,7 @@ frame's texture pass at 8 ms, the rest a frame later. r84 (walking, DLSS Quality
 display): 47.0 fps mean (r82, the same without the cap: 39.4), 14 lines under 29.5, 5 under 27. r85 (the same on
 the Parsec primary display, shots every 7 s): 39.7 fps; textures sharp, water lit, no faults in the shots. On in
 the launcher. The Parsec virtual display costs ~7 fps uncapped.
+
+r86 (as r84 with `VICTORY_TEXSPK_PASS_MS=4`): 44.7 fps, the same 14 lines under 29.5 (5 under 27): 8 stays.
+The remaining dips (about 12 % of the seconds while walking through the mission) sit in the heaviest moments
+(5,000-9,000 draws, the submitting thread 30-40 ms, the title waiting at presents) and in mission loads.
