@@ -425,6 +425,7 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
     if !host.card_ready() {
         return None;
     }
+    crate::ahead::want_card();
     // Only while the card has room: with this copy on it, a fifth of the
     // budget the system gives us must still be free. Copies are made when
     // the world loads, before the textures fill the card; the texture
@@ -463,7 +464,9 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
         return None;
     }
-    let buffer = host.uav_buffer(size);
+    // (one made ahead, if it is of that size and one is in store: `crate::ahead`)
+    let ahead = if size == crate::ahead::SIZE { crate::ahead::card() } else { None };
+    let buffer = ahead.or_else(|| host.uav_buffer(size));
     if buffer.is_none() {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
     }
@@ -1651,9 +1654,18 @@ fn spin_for(most: u64, there: impl Fn() -> bool) {
     }
 }
 
-/// How many threads are kept for [`wide`].
+/// How many threads are kept for [`wide`]: a quarter of the logical processors, 2 to 6
+/// (`VICTORY_WIDE_THREADS=<n>`, 1 to 32, in its place). foxhound 9f8838b made the default
+/// three eighths, 2 to 8 (6 of 16: cutscenes with 13 s of 256 at 40 ms or more in place of
+/// 28, runs v5q/v6q on a 7800X3D); our default is kept, `VICTORY_WIDE_THREADS=6` tries theirs.
 fn wide_threads() -> usize {
-    std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6)
+    static ASKED: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    let asked = *ASKED.get_or_init(|| {
+        let n = std::env::var("VICTORY_WIDE_THREADS").ok()?.trim().parse::<usize>().ok()?.clamp(1, 32);
+        tracing::info!(n, "threads kept for refreshes on several threads (VICTORY_WIDE_THREADS)");
+        Some(n)
+    });
+    asked.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6))
 }
 
 fn workers() -> &'static Workers {
