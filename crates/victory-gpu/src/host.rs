@@ -633,6 +633,39 @@ pub(crate) fn log_removal_context() {
     }
 }
 
+/// The gaps between presents since the last frame-rate line: the longest in
+/// microseconds, how many over 40 ms and over 50 ms, and the last present (in
+/// microseconds since [`frame_gap`] first ran). An average of 30 fps over the
+/// line's seconds can hide single long frames; these do not.
+static FRAME_GAPS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// A frame was presented: its gap to the one before.
+fn frame_gap() {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let now = START.get_or_init(std::time::Instant::now).elapsed().as_micros() as u64;
+    let last = FRAME_GAPS[3].swap(now, Ordering::Relaxed);
+    if last == 0 {
+        return;
+    }
+    let gap = now.saturating_sub(last);
+    FRAME_GAPS[0].fetch_max(gap, Ordering::Relaxed);
+    if gap > 40_000 {
+        FRAME_GAPS[1].fetch_add(1, Ordering::Relaxed);
+    }
+    if gap > 50_000 {
+        FRAME_GAPS[2].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// The frame-time line, beside the frame-rate line.
+fn frame_gap_line() {
+    let [longest, over40, over50] = [0, 1, 2].map(|i| FRAME_GAPS[i].swap(0, Ordering::Relaxed));
+    tracing::info!(
+        "frame times since the last line: longest {:.1} ms, {over40} frames over 40 ms, {over50} over 50 ms",
+        longest as f64 / 1000.0
+    );
+}
+
 /// Time spent in submissions since the last frame-rate line, in
 /// microseconds: preparing them on the CPU (title memory copies, texture
 /// detiling), then waiting for the GPU.
@@ -9551,10 +9584,12 @@ impl Meter {
         {
             self.copy_stats_frames += 1;
         }
+        frame_gap();
         let elapsed = self.since.elapsed();
         if elapsed < std::time::Duration::from_secs(1) {
             return;
         }
+        frame_gap_line();
         let drawn = crate::draw::drawn();
         let frames = f64::from(self.frames);
         let fps = frames / elapsed.as_secs_f64();
