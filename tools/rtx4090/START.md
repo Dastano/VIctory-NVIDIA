@@ -1,4 +1,4 @@
-# Starting the MASTER build (RTX 4090 PC)
+﻿# Starting the MASTER build (RTX 4090 PC)
 
 ```powershell
 cd C:\Users\hinze\foxhound
@@ -9,7 +9,7 @@ scripts\play-foxhound.ps1 -Exe F:\gta\gta6\game_scarlett_master.exe
 
 | Option | Values | Default | What |
 |---|---|---|---|
-| `-Exe` | path | – (required) | the title's `game_scarlett_master.exe` |
+| `-Exe` | path | â€“ (required) | the title's `game_scarlett_master.exe` |
 | `-Dlss` | `off` `dlaa` `quality` `balanced` `performance` | `quality` | DLSS mode (DLAA: native 1440p, sharper, more GPU) |
 | `-Fps` | 1-1000 | `30` | rendered frames a second; `1000` = no cap (higher average, less even) |
 | `-FrameGen` | switch | off | DLSS Frame Generation (needs the window on a display connected to the RTX 4090) |
@@ -18,8 +18,8 @@ scripts\play-foxhound.ps1 -Exe F:\gta\gta6\game_scarlett_master.exe
 | `-Res` | `1440` `1080to1440` `4k` | `1440` | output / scene size |
 | `-SeriesS` | switch | off | Series S profile (no faster here, softer) |
 | `-Build` | `release` `diag` | `release` | diagnostics build for captures / timelines |
-| `-More` | `@{VICTORY_X='1'}` | – | add or override any switch |
-| `-Shaders` `-Warm` `-Used` | switches | – | translate the shaders / make the pipelines ahead with the run's own switches (after a new build) |
+| `-More` | `@{VICTORY_X='1'}` | â€“ | add or override any switch |
+| `-Shaders` `-Warm` `-Used` | switches | â€“ | translate the shaders / make the pipelines ahead with the run's own switches (after a new build) |
 
 ## F1 menu
 
@@ -46,6 +46,6 @@ water light on). Measurements: `NOTES-master.md`.
 
 ## Known issues
 
-- A black box can still appear on the water around a floating object (water light); a fix is in progress.
-  `VICTORY_WATER_LIGHT=0` (or F1 → WATER LIGHT off) removes it, with darker water.
+- A black box on the water around floating objects was fixed in r88 (`VICTORY_WAVE64_WATER3`).
+  `VICTORY_WATER_LIGHT=0` (or F1 â†’ WATER LIGHT off) removes it, with darker water.
 - Memory grows over long sessions; restart after about an hour.

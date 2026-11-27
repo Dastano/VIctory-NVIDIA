@@ -218,3 +218,13 @@ the launcher. The Parsec virtual display costs ~7 fps uncapped.
 r86 (as r84 with `VICTORY_TEXSPK_PASS_MS=4`): 44.7 fps, the same 14 lines under 29.5 (5 under 27): 8 stays.
 The remaining dips (about 12 % of the seconds while walking through the mission) sit in the heaviest moments
 (5,000-9,000 draws, the submitting thread 30-40 ms, the title waiting at presents) and in mission loads.
+
+## The water's volumetric programs on 32-lane hosts (r88)
+
+Three water programs did not translate for 32-lane waves and were dropped: CS_TransmissionVolumetrics
+(6871d6e4b3ac9a10) and _VolumePortalsOnly (a10179ab7eda0dc3) were missing from the digests that try the
+wave-wide branch form; CS_TransmissionVolumetricsSubmerged (926c46bab3b86bd6) hit a regression where the loop
+form dropped the list of blocks that need every lane (`VICTORY_WAVE64_WATER3`, on; also fixes
+vfx_triangleClip:CS_DefragHeap_ComputeRelocations). The user's game had shown a black box on the water around a
+floating package. r88 (walking, DLSS Quality, no cap, shots every 6 s): water lit, no black boxes in any shot,
+including the bridge view; 38.75 fps mean (Parsec display), 13 of 90 lines under 29.5.
