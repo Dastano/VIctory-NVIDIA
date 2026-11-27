@@ -269,3 +269,8 @@ world much faster than walking and is the harder benchmark from now on.
 New in other forks (20:37, summarised by the GX Cube): trustno1's MFG Unlocker (frame generation for RTX 20/30;
 nothing for an RTX 40), Victory-Lap play29-31 (its biggest win, VICTORY_BVH_LOG_ONCE, concerns its BVH stand-in
 we do not run; constants in card memory saves card time, not our CPU limit): not taken.
+
+r97/r98 (boat drive; `VICTORY_CARD_FILLS`: fills around a copy at its place done on the card instead of waiting for
+flights, perf/card-fills, on): on 32.9 fps, 42 of 99 lines under 29.5 (24 under 27), over 50 ms 1,012; off (r98,
+same build) 32.9 fps, 48 under 29.5 (29 under 27), over 50 ms 625. A draw within the boat route's run-to-run
+spread; left on (byte-identical by its test, fewer dips).
