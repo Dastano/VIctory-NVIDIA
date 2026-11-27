@@ -228,3 +228,8 @@ form dropped the list of blocks that need every lane (`VICTORY_WAVE64_WATER3`, o
 vfx_triangleClip:CS_DefragHeap_ComputeRelocations). The user's game had shown a black box on the water around a
 floating package. r88 (walking, DLSS Quality, no cap, shots every 6 s): water lit, no black boxes in any shot,
 including the bridge view; 38.75 fps mean (Parsec display), 13 of 90 lines under 29.5.
+
+r89 (r88 + `VICTORY_EARLY_ALL=1`, every title pipeline started at creation): 39.1 fps (r88: 38.75), 10 of 89 lines
+under 29.5 (r88: 13 of 90), over 50 ms 260 (257), longest 667 ms: within noise; left off. `warm --used` found all
+83,821 booked pipelines already made: the first-use bursts at area loads (1,561 shaders in 5 s in a user session)
+are loads, not compiles.
