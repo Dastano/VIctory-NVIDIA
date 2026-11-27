@@ -201,3 +201,7 @@ r82 (walking, DLSS Quality, no cap): 39.4 fps mean, 14 of 115 lines under 29.5 (
 longest 224 ms; the card 88-90 % busy. With DLAA and no cap (r81) the card was 90-95 % busy at 34.8 fps: DLAA
 plus the water light make the card part of the limit once the cap is off. Best measured setup for frame rate:
 DLSS Quality, no cap.
+
+r83 (walking, DLSS Balanced, no cap): 40.35 fps mean, 12 of 115 lines under 29.5 (7 under 27): little better
+than Quality (r82: 39.4, 14): the remaining dips are not the card's; they are spikes of the title's and our CPU
+work at heavy moments of the mission. Recommended: DLSS Quality, no cap (or -Fps 30 for even frame times).
