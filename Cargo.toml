@@ -72,6 +72,8 @@ opt-level = 2
 
 [profile.release]
 debug = "line-tables-only"
+# Thin link-time optimisation across the crates (from soldier162/Victory-nvidia-soldier16).
+lto = "thin"
 
 # The development build: release code generation plus the `diagnostics`
 # feature (`cargo build --profile diag -p victory --features diagnostics`),
