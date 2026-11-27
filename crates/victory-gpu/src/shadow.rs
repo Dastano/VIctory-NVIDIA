@@ -1526,6 +1526,107 @@ struct Workers {
     more: std::sync::Condvar,
     /// How many jobs there are, for [`spin`].
     there: std::sync::atomic::AtomicUsize,
+    /// How many [`Hot`] stand: while one does, an idle helper waits awake
+    /// ([`passes_hot_us`]).
+    hot: AtomicUsize,
+    /// [`now_us`] of the last job begun or ended, or of the last [`hot`].
+    busy_at: AtomicU64,
+}
+
+/// Microseconds since the first call (for [`Workers::busy_at`]).
+fn now_us() -> u64 {
+    static BASE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    BASE.get_or_init(std::time::Instant::now).elapsed().as_micros() as u64
+}
+
+/// A switch of microseconds, read once: `default` unless its variable says
+/// a number (`0`: off). Tests set it ([`set_passes`]).
+fn micros(cell: &AtomicU64, name: &str, default: u64) -> u64 {
+    let v = cell.load(Ordering::Relaxed);
+    if v != u64::MAX {
+        return v;
+    }
+    let v = std::env::var(name).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default);
+    cell.store(v, Ordering::Relaxed);
+    v
+}
+
+static JOIN_SPIN: AtomicU64 = AtomicU64::new(u64::MAX);
+static HOT_US: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// `VICTORY_PASSES_JOIN_SPIN` (read here; microseconds, 250 by default, `0`
+/// off as before): the thread that spread work over the helpers ([`wide`];
+/// for a flush of refreshes the submitting thread) waits awake this long
+/// for the last of them before it sleeps on the lock; asleep it is woken
+/// some time after the last helper is done, in each of some 24 passes a
+/// frame. In `wide_tests::pass_overhead` a pass's cost beyond its work
+/// went from 18 to 14 us on an idle machine, from 30 to 20 with 16 threads
+/// busy beside and from 28 to 20 with 40. Only when the waiting thread goes
+/// on changes: the same work is done by the same threads, and it still
+/// waits for all of it.
+pub(crate) fn passes_join_spin_us() -> u64 {
+    micros(&JOIN_SPIN, "VICTORY_PASSES_JOIN_SPIN", 250)
+}
+
+/// `VICTORY_PASSES_HOT` (read here; microseconds, `0` by default: off, as
+/// before; `2000` is a good value to try): while a submission is prepared
+/// ([`hot`], from its start to its end) the helpers are woken at its start
+/// and wait awake for the next pass instead of sleeping, up to this long
+/// after their last work or the start, giving way to other threads of their
+/// core now and then (`yield_now`). A pass then finds them awake, and the
+/// waking at the start overlaps the submission's asking and planning. Only
+/// when work starts changes, not what is done nor by whom it may be done.
+/// Off by default: in `wide_tests::pass_overhead` it cut a pass's cost
+/// beyond its work from 18 to 3 us on an idle machine and from 30 to 8 us
+/// with 16 threads busy beside, but with more threads busy than cores
+/// (40 on 32) it grew from 28 to 119 us, the spinning helpers taking the
+/// cores the submitting thread and the title need. To be measured in the
+/// title before it is turned on.
+pub(crate) fn passes_hot_us() -> u64 {
+    micros(&HOT_US, "VICTORY_PASSES_HOT", 0)
+}
+
+/// Tests and benchmarks: [`passes_join_spin_us`] and [`passes_hot_us`]
+/// (`None`: as the environment says).
+#[cfg(test)]
+pub(crate) fn set_passes(join_spin: Option<u64>, hot: Option<u64>) {
+    JOIN_SPIN.store(join_spin.unwrap_or(u64::MAX), Ordering::Relaxed);
+    HOT_US.store(hot.unwrap_or(u64::MAX), Ordering::Relaxed);
+}
+
+/// While held, the helpers of [`wide`] are kept awake ([`passes_hot_us`]).
+pub(crate) struct Hot(bool);
+
+/// Keeps the helpers awake for a while ([`passes_hot_us`]): taken where a
+/// submission's preparing begins, dropped where it ends.
+pub(crate) fn hot() -> Hot {
+    if passes_hot_us() == 0 {
+        return Hot(false);
+    }
+    let workers = workers();
+    workers.busy_at.store(now_us(), Ordering::Relaxed);
+    if workers.hot.fetch_add(1, Ordering::AcqRel) == 0 {
+        // Woken now, they are awake when the first pass comes.
+        let _queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
+        workers.more.notify_all();
+    }
+    Hot(true)
+}
+
+impl Drop for Hot {
+    fn drop(&mut self) {
+        if self.0 {
+            workers().hot.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
+/// With [`hot`]: whether an idle helper is to stay awake.
+fn stay_awake(workers: &Workers) -> bool {
+    let most = passes_hot_us();
+    most != 0
+        && workers.hot.load(Ordering::Acquire) > 0
+        && now_us().saturating_sub(workers.busy_at.load(Ordering::Relaxed)) < most
 }
 
 /// Waits awake until `there` says so, `VICTORY_WIDE_SPIN` microseconds at
@@ -1534,6 +1635,11 @@ struct Workers {
 fn spin(there: impl Fn() -> bool) {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let most = *MOST.get_or_init(|| std::env::var("VICTORY_WIDE_SPIN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0));
+    spin_for(most, there);
+}
+
+/// Waits awake until `there` says so, `most` microseconds at most.
+fn spin_for(most: u64, there: impl Fn() -> bool) {
     if most == 0 {
         return;
     }
@@ -1557,6 +1663,8 @@ fn workers() -> &'static Workers {
         jobs: Mutex::new(std::collections::VecDeque::new()),
         more: std::sync::Condvar::new(),
         there: std::sync::atomic::AtomicUsize::new(0),
+        hot: AtomicUsize::new(0),
+        busy_at: AtomicU64::new(0),
     });
     STARTED.call_once(|| {
         for i in 0..wide_threads() {
@@ -1564,26 +1672,54 @@ fn workers() -> &'static Workers {
                 crate::cores::keep_helper_on_fast_cores("victory-wide");
                 let workers = WORKERS.get().expect("made above");
                 loop {
-                    let job = {
+                    let job = 'found: loop {
                         // A little while awake first: the next work comes
                         // within microseconds more often than not.
                         spin(|| workers.there.load(Ordering::Acquire) > 0);
-                        let mut jobs = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
-                        loop {
-                            if let Some(job) = jobs.pop_front() {
-                                workers.there.fetch_sub(1, Ordering::AcqRel);
-                                break job;
+                        // While a submission is prepared: awake until work
+                        // comes (`passes_hot_us`).
+                        let mut turns = 0u32;
+                        while workers.there.load(Ordering::Acquire) == 0 && stay_awake(workers) {
+                            for _ in 0..32 {
+                                std::hint::spin_loop();
                             }
-                            jobs = workers.more.wait(jobs).unwrap_or_else(|e| e.into_inner());
+                            turns = turns.wrapping_add(1);
+                            if turns % 16 == 0 {
+                                std::thread::yield_now();
+                            }
                         }
+                        let mut jobs = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
+                        if let Some(job) = jobs.pop_front() {
+                            workers.there.fetch_sub(1, Ordering::AcqRel);
+                            break 'found job;
+                        }
+                        if stay_awake(workers) {
+                            continue;
+                        }
+                        jobs = workers.more.wait(jobs).unwrap_or_else(|e| e.into_inner());
+                        if let Some(job) = jobs.pop_front() {
+                            workers.there.fetch_sub(1, Ordering::AcqRel);
+                            break 'found job;
+                        }
+                        // (Woken by `hot`, or for a job another took.)
                     };
+                    workers.busy_at.store(now_us(), Ordering::Relaxed);
                     let _working = crate::timeline::span("a job for another thread");
                     job();
+                    workers.busy_at.store(now_us(), Ordering::Relaxed);
                 }
             });
         }
     });
     workers
+}
+
+/// What is left of a [`wide`]: how many jobs are not done, and the word
+/// when none is.
+struct Left {
+    n: AtomicUsize,
+    lock: Mutex<()>,
+    done: std::sync::Condvar,
 }
 
 /// Runs `jobs` on the kept threads and on this one, and returns when all
@@ -1603,7 +1739,7 @@ fn wide(jobs: Vec<Job>) {
     // meanwhile looks at the queue before it sleeps again, and this thread
     // takes what nobody took.
     let wake = (jobs.len() - 1).min(wide_threads());
-    let left = Arc::new((Mutex::new(jobs.len()), std::sync::Condvar::new()));
+    let left = Arc::new(Left { n: AtomicUsize::new(jobs.len()), lock: Mutex::new(()), done: std::sync::Condvar::new() });
     {
         let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
         for job in jobs {
@@ -1611,10 +1747,11 @@ fn wide(jobs: Vec<Job>) {
             workers.there.fetch_add(1, Ordering::AcqRel);
             queue.push_back(Box::new(move || {
                 job();
-                let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
-                *n -= 1;
-                if *n == 0 {
-                    left.1.notify_all();
+                if left.n.fetch_sub(1, Ordering::AcqRel) == 1 {
+                    // Under the lock: a waiter that saw some left is asleep
+                    // on it by now, or looks again after this.
+                    let _held = left.lock.lock().unwrap_or_else(|e| e.into_inner());
+                    left.done.notify_all();
                 }
             }));
         }
@@ -1634,10 +1771,13 @@ fn wide(jobs: Vec<Job>) {
             None => break,
         }
     }
-    spin(|| left.0.try_lock().is_ok_and(|n| *n == 0));
-    let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
-    while *n > 0 {
-        n = left.1.wait(n).unwrap_or_else(|e| e.into_inner());
+    let all_done = || left.n.load(Ordering::Acquire) == 0;
+    spin(all_done);
+    // (Awake a while longer: `VICTORY_PASSES_JOIN_SPIN`.)
+    spin_for(passes_join_spin_us(), all_done);
+    let mut held = left.lock.lock().unwrap_or_else(|e| e.into_inner());
+    while !all_done() {
+        held = left.done.wait(held).unwrap_or_else(|e| e.into_inner());
     }
 }
 
@@ -1863,6 +2003,87 @@ mod wide_tests {
     use super::{Job, PIECE, WIDE_JOB, copy_jobs, find_pieces, wide};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Waits awake `us` microseconds.
+    fn busy(us: u64) {
+        let began = std::time::Instant::now();
+        while (began.elapsed().as_micros() as u64) < us {
+            std::hint::spin_loop();
+        }
+    }
+
+    /// What a pass costs beyond its work (`VICTORY_PASSES_JOIN_SPIN`,
+    /// `VICTORY_PASSES_HOT`): passes of as many pieces as there are threads,
+    /// each 20 us of work, with 300 us of the submitting thread's own work
+    /// between them (as between a submission's passes), as before (asleep
+    /// between passes, asleep at the join), with the join awake, and with
+    /// the helpers kept awake too. Run with `cargo test --release -p
+    /// victory-gpu -- --ignored --nocapture pass_overhead`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn pass_overhead() {
+        const WORK: u64 = 20;
+        const PASSES: usize = 400;
+        let pieces = super::wide_threads() + 1;
+        // `VICTORY_BENCH_LOAD=n`: n threads busy beside, as the title's are.
+        let load: usize = std::env::var("VICTORY_BENCH_LOAD").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let busy_threads: Vec<_> = (0..load)
+            .map(|_| {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    let mut x = 0u64;
+                    while !stop.load(Ordering::Relaxed) {
+                        for i in 0..10_000u64 {
+                            x = std::hint::black_box(x.wrapping_mul(31).wrapping_add(i));
+                        }
+                    }
+                })
+            })
+            .collect();
+        for (name, join, hot) in [("as before", 0, 0), ("join awake", 250, 0), ("join awake, helpers hot", 250, 2000)] {
+            super::set_passes(Some(join), Some(hot));
+            let _hot = super::hot();
+            let mut took: Vec<f64> = Vec::with_capacity(PASSES);
+            for _ in 0..PASSES {
+                busy(300);
+                let began = std::time::Instant::now();
+                super::wide_each(pieces, |_| busy(WORK));
+                took.push(began.elapsed().as_secs_f64() * 1e6 - WORK as f64);
+            }
+            took.sort_by(f64::total_cmp);
+            let mean = took.iter().sum::<f64>() / PASSES as f64;
+            println!(
+                "{name} ({load} threads busy beside): {pieces} pieces of {WORK} us on {} threads and this one: beyond the work \
+                 {mean:.1} us a pass in the mean, median {:.1}, p90 {:.1}; for 24 passes {:.2} ms",
+                super::wide_threads(),
+                took[PASSES / 2],
+                took[PASSES * 9 / 10],
+                mean * 24.0 / 1000.0
+            );
+        }
+        super::set_passes(None, None);
+        stop.store(true, Ordering::Relaxed);
+        busy_threads.into_iter().for_each(|t| t.join().unwrap());
+    }
+
+    /// With the helpers kept awake ([`super::hot`]) and the join awake, every
+    /// job still runs once, and `wide` returns only when all have.
+    #[test]
+    fn hot_helpers_run_every_job() {
+        super::set_passes(Some(250), Some(2000));
+        let hot = super::hot();
+        for n in [2usize, 3, 7, 40, 1000] {
+            let done = Arc::new(AtomicUsize::new(0));
+            let seen = done.clone();
+            super::wide_each(n, move |_| {
+                seen.fetch_add(1, Ordering::Relaxed);
+            });
+            assert_eq!(done.load(Ordering::Relaxed), n);
+        }
+        drop(hot);
+        super::set_passes(None, None);
+    }
 
     /// Every job runs once, however many there are, and `wide` returns
     /// only when all have.

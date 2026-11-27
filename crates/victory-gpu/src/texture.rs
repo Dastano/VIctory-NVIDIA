@@ -1324,6 +1324,12 @@ pub(crate) fn card_writes(list: &HostList, resource: This, texture: &ID3D12Resou
 }
 
 impl Staging {
+    /// The bytes of title memory a refresh reads (`VICTORY_PASSES_LONG_FIRST`
+    /// orders a pass's textures by it, `crate::host`).
+    pub(crate) fn read_bytes(&self) -> usize {
+        self.read
+    }
+
     /// Levels on demand: what says, beside the mapping, which levels of
     /// the texture are the title's now. First the lowest level a live view
     /// of the texture shows (0 without a view that says): the title's own
