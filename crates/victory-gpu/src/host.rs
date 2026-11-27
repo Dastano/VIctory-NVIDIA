@@ -4638,6 +4638,11 @@ impl Host {
                         }
                     }
                     list.Close()?;
+                    // (The bytes it sends are in their memory by now:
+                    // `send::beside`.)
+                    if let Some(own) = &own {
+                        own.wait();
+                    }
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     Ok(())
                 })()
@@ -4649,6 +4654,7 @@ impl Host {
         }
         card_part(4, recording);
         drop(order);
+        let sends = own.map(send::Own::memory);
         let mut plan = CardPlan {
             ranges: Vec::new(),
             check: None,
@@ -4656,7 +4662,7 @@ impl Host {
             lists: used,
             sent_as,
             looks,
-            sends: own.map(send::Own::memory),
+            sends,
         };
         // Each byte once, as the copy-back joins the declared ranges. The
         // results go behind those of plans still in the air.

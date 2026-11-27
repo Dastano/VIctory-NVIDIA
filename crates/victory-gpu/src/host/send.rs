@@ -21,6 +21,7 @@
 
 use super::*;
 use crate::shadow::Shadow;
+use std::sync::Arc;
 
 pub(super) fn own() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -175,30 +176,54 @@ pub(super) static STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync:
 
 /// One copy's sends: ranges copied (offset in the copy, in the memory,
 /// bytes), and its pairs (where in the memory, how many).
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Copy {
     runs: Vec<(usize, u64, usize)>,
     pairs: (u64, u32),
 }
 
-/// Where a submission's bytes are taken to.
-pub(super) struct Own {
+/// Where a submission's bytes are taken to. Borrows the dirty lists it was
+/// taken from: with [`beside`] their bytes are taken while it lives, and it
+/// waits for that when dropped (so it is not to be forgotten).
+pub(super) struct Own<'a> {
     memory: Memory,
     copies: Vec<Copy>,
+    taking: Option<Beside>,
+    _dirty: std::marker::PhantomData<&'a ()>,
 }
 
 /// Runs whose pairs are one piece of work.
 const RUNS_AT_A_TIME: usize = 4096;
 
-/// Takes what `dirty` sends up out of the CPU sides.
-pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, usize)>)]) -> Option<Own> {
-    let began = std::time::Instant::now();
-    pass(host)?;
+/// Whether a submission's bytes are taken out of the CPU sides on a thread
+/// of their own while the submitting thread records the list that sends
+/// them (`VICTORY_CC_TAKE_BESIDE`, on by default; `0`: on the submitting
+/// thread, before the list, as before).
+///
+/// Of the 3.6 ms a frame of copies in the card's memory in run r74 (2,000
+/// to 6,000 draws), 1.5 were the bytes taken (20-29 MB in some 400 runs and
+/// 30,000-180,000 words) and 1.2 the list recorded and sent, one after the
+/// other on the submitting thread; the list needs only where the bytes go
+/// ([`layout`], still made first), not the bytes. The list goes to the
+/// queue only once they are all taken ([`Own::wait`]). The same ranges go
+/// to the same places in the memory with the same bytes: between the dirty
+/// lists being taken and the list sent, the submitting thread records only,
+/// and it alone writes the CPU sides in those ranges (refreshes; a landing
+/// writes under shader writes, as it may while they are taken on it).
+fn beside() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CC_TAKE_BESIDE").is_none_or(|v| v != "0"))
+}
+
+/// Where each copy's sends lie in the memory, and the bytes of memory they
+/// need, for the dirty ranges of each copy in turn.
+fn layout<'r>(dirty: impl Iterator<Item = &'r [(usize, usize)]>) -> (Vec<Copy>, u64) {
     // Runs of whole words of the copy: only those are pairs. (A byte beside
     // them in a word may be the card's.)
     let short = |&(a, b): &(usize, usize)| short(a, b - a);
     let mut at = 0u64;
-    let mut copies = Vec::with_capacity(dirty.len());
-    for (_, ranges) in dirty {
+    let mut copies = Vec::new();
+    for ranges in dirty {
         let mut runs = Vec::new();
         for &(a, b) in ranges.iter().filter(|r| !short(r)) {
             runs.push((a, at, b - a));
@@ -208,52 +233,177 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
         copies.push(Copy { runs, pairs: (at, words as u32) });
         at += (words as u64 * 8).next_multiple_of(16);
     }
+    (copies, at)
+}
+
+/// The bytes of a submission to be taken: runs copied (from, to, bytes) and
+/// pieces of pairs (the copy's CPU side, its ranges, where the pairs go).
+struct Taking<'a> {
+    moves: Vec<(usize, usize, usize)>,
+    work: Vec<(usize, &'a [(usize, usize)], usize)>,
+}
+
+impl<'a> Taking<'a> {
+    /// For `sources` (each copy's CPU side and dirty ranges) laid out as
+    /// `copies` in memory mapped at `data`.
+    fn new(sources: &[(usize, &'a [(usize, usize)])], copies: &[Copy], data: usize) -> Self {
+        let short = |&(a, b): &(usize, usize)| short(a, b - a);
+        let mut moves: Vec<(usize, usize, usize)> = Vec::new();
+        let mut work: Vec<(usize, &'a [(usize, usize)], usize)> = Vec::new();
+        for (&(from, ranges), copy) in sources.iter().zip(copies) {
+            moves.extend(copy.runs.iter().map(|&(a, to, n)| (from + a, data + to as usize, n)));
+            // (80,000 runs of some words a frame: in pieces of work.)
+            let mut to = data + copy.pairs.0 as usize;
+            for ranges in ranges.chunks(RUNS_AT_A_TIME) {
+                let words: usize = ranges.iter().filter(|r| short(r)).map(|r| (r.1 - r.0) / 4).sum();
+                if words > 0 {
+                    work.push((from, ranges, to));
+                    to += words * 8;
+                }
+            }
+        }
+        Taking { moves, work }
+    }
+
+    /// Copies the runs and stores the pairs.
+    ///
+    /// # Safety
+    /// The sources' ranges lie in mappings no one writes meanwhile, and the
+    /// memory at `data` holds the layout's bytes.
+    unsafe fn run(self) {
+        let Taking { moves, work } = self;
+        let one = |i: usize| {
+            let (from, ranges, to) = work[i];
+            let mut to = to as *mut [u32; 2];
+            for &(a, b) in ranges.iter().filter(|&&(a, b)| short(a, b - a)) {
+                for offset in (a..b).step_by(4) {
+                    // SAFETY: inside the copy's mapping (its CPU side, which
+                    // the thread that asked, and waits, alone writes in these
+                    // ranges) and inside the memory, which has room for every
+                    // pair, a piece of work's behind the last one's.
+                    unsafe {
+                        let word = ((from + offset) as *const u32).read_unaligned();
+                        to.write([offset as u32, word]);
+                        to = to.add(1);
+                    }
+                }
+            }
+        };
+        crate::land::each_under(work.len(), &one);
+        crate::shadow::copy_all(moves);
+    }
+}
+
+/// A [`Taking`] on the thread for it ([`beside`]): whether it is done, and
+/// whether it panicked.
+struct Beside(Arc<(Mutex<Option<bool>>, std::sync::Condvar)>);
+
+impl Beside {
+    /// Hands `taking` to the thread; done on this one (`None`) if there is
+    /// no thread.
+    ///
+    /// # Safety
+    /// As [`Taking::run`]; and what it borrows lives until the result is
+    /// waited for ([`Beside::wait`], or dropped), so it is not forgotten.
+    unsafe fn start(taking: Taking<'_>, began: std::time::Instant) -> Option<Beside> {
+        type Job = Box<dyn FnOnce() + Send>;
+        static THREAD: OnceLock<Option<Mutex<std::sync::mpsc::Sender<Job>>>> = OnceLock::new();
+        let thread = THREAD.get_or_init(|| {
+            let (send, jobs) = std::sync::mpsc::channel::<Job>();
+            std::thread::Builder::new()
+                .name("victory-take".into())
+                .spawn(move || {
+                    crate::cores::keep_helper_on_fast_cores("victory-take");
+                    for job in jobs {
+                        job();
+                    }
+                })
+                .ok()
+                .map(|_| Mutex::new(send))
+        });
+        let done = Arc::new((Mutex::new(None), std::sync::Condvar::new()));
+        // SAFETY: the caller's: what it borrows outlives the waiting.
+        let taking: Taking<'static> = unsafe { std::mem::transmute::<Taking<'_>, Taking<'static>>(taking) };
+        let job: Job = {
+            let done = done.clone();
+            Box::new(move || {
+                // SAFETY: the caller's.
+                let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { taking.run() }));
+                STATS[3].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+                *done.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(ran.is_err());
+                done.1.notify_all();
+            })
+        };
+        let Some(thread) = thread else {
+            job();
+            return Some(Beside(done));
+        };
+        match thread.lock().unwrap_or_else(|e| e.into_inner()).send(job) {
+            Ok(()) => Some(Beside(done)),
+            // (The thread is gone: the job comes back, done here.)
+            Err(std::sync::mpsc::SendError(job)) => {
+                job();
+                Some(Beside(done))
+            }
+        }
+    }
+
+    /// Waits for the bytes; whether they were all taken.
+    fn wait(&self) -> bool {
+        let mut done = self.0.0.lock().unwrap_or_else(|e| e.into_inner());
+        while done.is_none() {
+            done = self.0.1.wait(done).unwrap_or_else(|e| e.into_inner());
+        }
+        *done == Some(false)
+    }
+}
+
+impl Drop for Beside {
+    fn drop(&mut self) {
+        self.wait();
+    }
+}
+
+/// Takes what `dirty` sends up out of the CPU sides (with [`beside`] on a
+/// thread of its own: [`Own::wait`] before the list that sends it goes to
+/// the queue).
+pub(super) fn take<'a>(host: &Host, dirty: &'a [(std::sync::Arc<Shadow>, Vec<(usize, usize)>)]) -> Option<Own<'a>> {
+    let began = std::time::Instant::now();
+    pass(host)?;
+    let (copies, at) = layout(dirty.iter().map(|(_, ranges)| ranges.as_slice()));
     if at == 0 {
         return None;
     }
     let memory = memory(host, at)?;
-    let mut moves: Vec<(usize, usize, usize)> = Vec::new();
-    let mut work: Vec<(usize, &[(usize, usize)], usize)> = Vec::new();
-    for ((shadow, ranges), copy) in dirty.iter().zip(&copies) {
-        let from = shadow.card_data() as usize;
-        moves.extend(copy.runs.iter().map(|&(a, to, n)| (from + a, memory.data + to as usize, n)));
-        // (80,000 runs of some words a frame: in pieces of work.)
-        let mut to = memory.data + copy.pairs.0 as usize;
-        for ranges in ranges.chunks(RUNS_AT_A_TIME) {
-            let words: usize = ranges.iter().filter(|r| short(r)).map(|r| (r.1 - r.0) / 4).sum();
-            if words > 0 {
-                work.push((from, ranges, to));
-                to += words * 8;
-            }
-        }
-    }
-    let one = |i: usize| {
-        let (from, ranges, to) = work[i];
-        let mut to = to as *mut [u32; 2];
-        for &(a, b) in ranges.iter().filter(|r| short(r)) {
-            for offset in (a..b).step_by(4) {
-                // SAFETY: inside the copy's mapping (its CPU side, which
-                // the thread that asked, and waits, alone writes in these
-                // ranges) and inside the memory, which has room for every
-                // pair, a piece of work's behind the last one's.
-                unsafe {
-                    let word = ((from + offset) as *const u32).read_unaligned();
-                    to.write([offset as u32, word]);
-                    to = to.add(1);
-                }
-            }
-        }
-    };
-    crate::land::each_under(work.len(), &one);
-    STATS[0].fetch_add(moves.iter().map(|m| m.2 as u64).sum(), Ordering::Relaxed);
-    STATS[1].fetch_add(moves.len() as u64, Ordering::Relaxed);
+    let sources: Vec<(usize, &'a [(usize, usize)])> =
+        dirty.iter().map(|(shadow, ranges)| (shadow.card_data() as usize, ranges.as_slice())).collect();
+    let taking = Taking::new(&sources, &copies, memory.data);
+    STATS[0].fetch_add(taking.moves.iter().map(|m| m.2 as u64).sum(), Ordering::Relaxed);
+    STATS[1].fetch_add(taking.moves.len() as u64, Ordering::Relaxed);
     STATS[2].fetch_add(copies.iter().map(|c| u64::from(c.pairs.1)).sum(), Ordering::Relaxed);
-    crate::shadow::copy_all(moves);
-    STATS[3].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
-    Some(Own { memory, copies })
+    let taking = if beside() {
+        // SAFETY: the ranges lie in the copies' mappings, written meanwhile
+        // by no one ([`beside`]); the memory holds the layout; `dirty` is
+        // borrowed by the `Own`, which waits when dropped.
+        unsafe { Beside::start(taking, began) }
+    } else {
+        // SAFETY: as above, on this thread.
+        unsafe { taking.run() };
+        STATS[3].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+        None
+    };
+    Some(Own { memory, copies, taking, _dirty: std::marker::PhantomData })
 }
 
-impl Own {
+impl Own<'_> {
+    /// Waits until the bytes are all in the memory ([`beside`]): before the
+    /// list that sends them goes to the queue.
+    pub(super) fn wait(&self) {
+        if self.taking.as_ref().is_some_and(|t| !t.wait()) {
+            fail(format_args!("the bytes a submission sends up could not be taken out of the CPU sides"));
+        }
+    }
+
     /// Records the sends into `list`; the copies that `looked` says are in
     /// `COPY_DEST`, the others in the common state. Those with a "before" are
     /// left readable by compute shaders.
@@ -324,6 +474,101 @@ impl Own {
 
     /// The memory, to be kept until the submission has run.
     pub(super) fn memory(self) -> Memory {
-        self.memory
+        self.wait();
+        let Own { memory, taking, .. } = self;
+        drop(taking);
+        memory
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Dirty ranges of a copy of `len` bytes: in order, apart, of every
+    /// kind (runs of words, of odd bytes, short and long).
+    fn ranges(seed: &mut u64, len: usize) -> Vec<(usize, usize)> {
+        let mut next = |n: usize| {
+            *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((*seed >> 33) as usize) % n
+        };
+        let mut out = Vec::new();
+        let mut at = next(64);
+        while at < len {
+            let n = match next(4) {
+                0 => 4 * (1 + next(64)),
+                1 => 1 + next(300),
+                2 => 4 * (1 + next(16)),
+                _ => 1 + next(20_000),
+            };
+            let a = if next(2) == 0 { at.next_multiple_of(4) } else { at };
+            let b = (a + n).min(len);
+            if a < b {
+                out.push((a, b));
+            }
+            at = b + 1 + next(512);
+        }
+        out
+    }
+
+    /// The bytes taken, laid out by [`layout`], with or without [`Beside`].
+    fn taken(sources: &[(Vec<u8>, Vec<(usize, usize)>)], beside: bool) -> (Vec<Copy>, Vec<u8>) {
+        let (copies, at) = layout(sources.iter().map(|(_, r)| r.as_slice()));
+        let mut memory = vec![0u64; (at as usize).div_ceil(8)];
+        let data = memory.as_mut_ptr() as usize;
+        let borrowed: Vec<(usize, &[(usize, usize)])> = sources.iter().map(|(b, r)| (b.as_ptr() as usize, r.as_slice())).collect();
+        let taking = Taking::new(&borrowed, &copies, data);
+        // SAFETY: the sources and the memory live through the waiting, and
+        // nothing writes them meanwhile.
+        unsafe {
+            if beside {
+                assert!(Beside::start(taking, std::time::Instant::now()).is_some_and(|t| t.wait()));
+            } else {
+                taking.run();
+            }
+        }
+        let bytes = memory.iter().flat_map(|w| w.to_le_bytes()).take(at as usize).collect();
+        (copies, bytes)
+    }
+
+    #[test]
+    fn beside_takes_the_same_bytes_to_the_same_places() {
+        let mut seed = 7u64;
+        let mut sources: Vec<(Vec<u8>, Vec<(usize, usize)>)> = Vec::new();
+        for (i, len) in [1 << 16, 3 << 20, 100, 6 << 20, 0, 1 << 20].into_iter().enumerate() {
+            let bytes: Vec<u8> = (0..len).map(|j| (j * 31 + i * 7 + j / 977) as u8).collect();
+            let mut r = ranges(&mut seed, len);
+            if i == 3 {
+                // More than [`crate::shadow::copy_all`] does on one thread.
+                r = vec![(8, 5 << 20), (5 << 20 | 4, 5 << 20 | 64)];
+            }
+            sources.push((bytes, r));
+        }
+        let (copies, here) = taken(&sources, false);
+        for _ in 0..3 {
+            let (laid, there) = taken(&sources, true);
+            assert_eq!(laid, copies, "the same ranges to the same places");
+            assert!(here == there, "the same bytes");
+        }
+        // And they are the copies' bytes: each run where the layout says,
+        // the words of the short runs as pairs in order.
+        for ((bytes, ranges), copy) in sources.iter().zip(&copies) {
+            for &(a, to, n) in &copy.runs {
+                assert_eq!(&here[to as usize..][..n], &bytes[a..a + n]);
+            }
+            let words: Vec<(u32, u32)> = ranges
+                .iter()
+                .filter(|&&(a, b)| short(a, b - a))
+                .flat_map(|&(a, b)| (a..b).step_by(4))
+                .map(|o| (o as u32, u32::from_le_bytes(bytes[o..o + 4].try_into().unwrap())))
+                .collect();
+            assert_eq!(words.len(), copy.pairs.1 as usize);
+            for (i, &(o, w)) in words.iter().enumerate() {
+                let at = copy.pairs.0 as usize + i * 8;
+                assert_eq!(u32::from_le_bytes(here[at..at + 4].try_into().unwrap()), o);
+                assert_eq!(u32::from_le_bytes(here[at + 4..at + 8].try_into().unwrap()), w);
+            }
+        }
+        assert!(copies.iter().any(|c| c.pairs.1 > 0) && copies.iter().any(|c| !c.runs.is_empty()));
     }
 }
