@@ -299,3 +299,8 @@ the card with the most dedicated memory (or VICTORY_ADAPTER). r105 (boat drive, 
 mean, 21 of 99 lines under 29.5 (10 under 27), over 50 ms 539, longest 320 ms - the best boat run so far.
 
 r106 (boat drive; `VICTORY_CARD_RUNS_SORTED`: card-step places sorted by host copy and address, read in runs): 1,502 places in 1,322 copies (few runs); 32.0 fps, 45 of 99 lines under 29.5 (r105: 35.4 / 21): off in the launcher.
+
+r107: r105's build and settings again (boat drive): 33.5 fps, 37 of 99 lines under 29.5 (28 under 27), over
+50 ms 693 - against r105's 35.4 / 21 / 10. The boat route spreads by about 2 fps and 16 dip lines between runs of
+the same build (where the boat goes depends on its physics). So the single-run verdicts r100/r101, r103/r104 and
+r106 (1-3 fps apart) are within that spread; a change needs several runs a side to be judged on this route.
