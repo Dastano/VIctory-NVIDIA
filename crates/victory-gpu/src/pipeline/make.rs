@@ -85,9 +85,16 @@ fn leave_out() -> &'static [String] {
 /// starting depth bounds in LDS after its early return, so the others folded theirs into
 /// whatever the LDS held and no thread wrote the tile's light. The translator now stores
 /// those starting values in every thread first (`victory_shader::emit::wave64_fix`,
-/// `VICTORY_WAVE64_FIX`, on by default), and the programs run. Left out only with that off
-/// (unless `VICTORY_WATER_LIGHT=1`) or with `VICTORY_WATER_LIGHT=0`: the water then has no
-/// light of its own depth (darker, bluer) and the card saves those milliseconds.
+/// `VICTORY_WAVE64_FIX`, on by default). That alone still left small black blocks over open
+/// water (RTX 4090, run r66); foxhound 454ffea, which runs these programs by default, adds
+/// three translator fixes, ported here: the group's first thread sets up its LDS whether its
+/// lane runs or not (`VICTORY_LDS_FIRST_INIT`), loop branches are taken by each host wave
+/// together (`VICTORY_LOOPS_WAVE`, the tiles' local-light lists) and a skip stays around a
+/// loop that never ends with no lane left (flickering dark tiles). The programs run by
+/// default again. Left out with `VICTORY_WATER_LIGHT=0`, or with both LDS set-up fixes off
+/// (`VICTORY_WAVE64_FIX=0` and `VICTORY_LDS_FIRST_INIT=0`) unless `VICTORY_WATER_LIGHT=1`:
+/// the water then has no light of its own depth (darker, bluer) and the card saves those
+/// milliseconds.
 const WATER_LIGHT: [&str; 2] = ["5dc3b25986622949", "6f225b641c5b0708"];
 
 fn water_light_left_out(shaders: &[Arc<Shader>]) -> bool {
@@ -95,9 +102,9 @@ fn water_light_left_out(shaders: &[Arc<Shader>]) -> bool {
     *LEAVE_OUT.get_or_init(|| match std::env::var("VICTORY_WATER_LIGHT").as_deref() {
         Ok("1") => false,
         Ok("0") => true,
-        // Left out unless asked for: with VICTORY_WAVE64_FIX on, the RTX 4090 PC's run r66 (the first boat
-        // ride) still showed small black blocks scattered over the open water around the boat.
-        _ => true,
+        // (r66, RTX 4090, VICTORY_WAVE64_FIX alone: small black blocks over the open water;
+        // foxhound's fixes above are meant to take them, not yet seen in a run here)
+        _ => !victory_shader::emit::wave64_fix() && !victory_shader::emit::lds_first_init(),
     }) && victory_shader::emit::host_settings()[0] == 32
         && shaders.iter().any(|s| WATER_LIGHT.contains(&s.hash.as_str()))
 }
@@ -107,7 +114,7 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
         return Some("named in VICTORY_LEAVE_OUT, left out");
     }
     if water_light_left_out(shaders) {
-        return Some("the water's tiled light on a host of 32-lane waves (VICTORY_WATER_LIGHT=0, or VICTORY_WAVE64_FIX=0: dark blocks), left out");
+        return Some("the water's tiled light on a host of 32-lane waves (VICTORY_WATER_LIGHT=0, or both VICTORY_WAVE64_FIX=0 and VICTORY_LDS_FIRST_INIT=0: dark blocks), left out");
     }
     static SKIP_RT_RESOLVE: OnceLock<bool> = OnceLock::new();
     let skip_rt = *SKIP_RT_RESOLVE.get_or_init(|| {

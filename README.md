@@ -142,7 +142,11 @@ speed, in the picture and in simply being able to play it:
   card a frame. The blocks were tiles whose corner pixel is not water (that
   thread set up the tile's LDS start values after its early return); the
   translator now sets them up in every thread (`VICTORY_WAVE64_FIX`, on by
-  default), and the programs run again. WATER LIGHT in the menu
+  default), and, as foxhound 454ffea does, by the first thread whether its
+  lane runs or not (`VICTORY_LDS_FIRST_INIT`), takes loop branches per host
+  wave together (`VICTORY_LOOPS_WAVE`, the tiles' local-light lists) and keeps
+  a skip around a loop that never ends with no lane left (flickering tiles);
+  the programs run again by default. WATER LIGHT in the menu
   (`VICTORY_WATER_LIGHT=0`) leaves them out: about 5 fps more on the first
   boat ride (RTX 5070), with water that is darker and bluer.
 - **One command to play**: the launcher builds the layer the first time and

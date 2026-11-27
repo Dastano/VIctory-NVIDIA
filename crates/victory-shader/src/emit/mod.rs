@@ -121,7 +121,7 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
 pub use sampler::StaticSampler;
-pub use lds_init::wave64_fix;
+pub use lds_init::{lds_first_init, wave64_fix};
 pub use lower::{host_settings, set_host_max_wave, set_host_rdna};
 pub use rect::rect_list_gs;
 pub use shader::{
@@ -934,8 +934,88 @@ fn widen(
     }
 }
 
-/// The translated program, and the wave size it requires of the host.
+/// Which programs get the branches that close or leave their loops taken by each host wave
+/// together where cross-lane code depends on the wave ([`emit_program`]):
+/// - unset or `1`: console wave64 compute programs on a host of 32-lane waves;
+/// - `2`: every compute program;
+/// - `0`: none, as before.
+///
+/// From foxhound 454ffea, as the skip kept around a loop that never ends with no lane left
+/// (`ir::without_skips`) and the first thread's LDS set-up (`VICTORY_LDS_FIRST_INIT`).
+fn loops_wave(native: &NativeProgram) -> bool {
+    if native.stage != HwStage::Cs {
+        return false;
+    }
+    match std::env::var("VICTORY_LOOPS_WAVE").ok().as_deref().map(str::trim) {
+        Some("0") => false,
+        Some("2") => true,
+        _ => native.wave64 && lower::host_max_wave() == 32,
+    }
+}
+
+/// The translated program, and the wave size it requires of the host:
+/// [`emit_program_plain`]; a program that comes out depending on the host's waves is
+/// translated once more with the per-lane branches that close or leave its loops taken by
+/// each host wave together ([`structure::structure_wide_host`]), and that translation is the
+/// one given if it needs no wider waves.
+///
+/// Why: the lowering turns the console's wave loops into loops each lane leaves on its own,
+/// and takes the code behind a loop as code the whole wave runs together. On NVIDIA the lanes
+/// that left a loop early run on as a wave of their own, so a ballot, a first-lane read or an
+/// exchange between the halves of a console wave behind the loop saw a part of the wave.
+/// Seen in `water_shading:CS_TransmissionVolumetrics_GenerateTiles` (the game, build 1.0.2.1, capture
+/// water2): the tiles with local lights never counted themselves in (the lanes without one
+/// arrived later and wrote "no lane" over their ballot), their list stayed empty and those
+/// tiles of the water kept no light: dark rectangles beside lit objects.
 fn emit_program(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<(HostShader, Option<u32>), ShaderError> {
+    let first = emit_program_plain(c, native, p, st, io, res);
+    let Ok((_, Some(wave))) = &first else {
+        return first;
+    };
+    if !loops_wave(native) || !st.host_wide.is_empty() {
+        return first;
+    }
+    let loops = lower::loop_branches(p, st);
+    if loops.is_empty() {
+        return first;
+    }
+    let needs = lower::take_needs();
+    let again = structure::structure_wide_host(p, &st.wide, &loops).and_then(|st| {
+        let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
+        emit_program_plain(c, native, p, &st, io, &res)
+    });
+    let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
+    match again {
+        Ok((shader, Some(w))) if w <= *wave => {
+            if why {
+                eprintln!("WAVE-LOOPS {} loop branches taken by each host wave together", loops.len());
+            }
+            lower::take_needs();
+            Ok((shader, Some(w)))
+        }
+        other => {
+            if why {
+                let what = match &other {
+                    Ok((_, w)) => format!("wave {w:?}"),
+                    Err(e) => e.to_string(),
+                };
+                eprintln!("WAVE-LOOPS not taken ({} loop branches): {what}", loops.len());
+            }
+            lower::set_needs(needs);
+            first
+        }
+    }
+}
+
+/// One translation of the program as it is structured ([`emit_program`]).
+fn emit_program_plain(
     c: &Container,
     native: &NativeProgram,
     p: &ir::Program,

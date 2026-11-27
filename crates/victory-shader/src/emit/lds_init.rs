@@ -30,6 +30,17 @@ pub fn wave64_fix() -> bool {
     std::env::var_os("VICTORY_WAVE64_FIX").is_none_or(|v| v != "0")
 }
 
+/// Whether a thread group's set-up of its shared memory by its first thread alone (constants
+/// to constant addresses under `v_cmpx_eq_u32 exec, 0, <the thread's place>`) is done by that
+/// thread whether its lane still runs there or not (`Lower::first_thread_init`, from
+/// foxhound 454ffea): on unless `VICTORY_LDS_FIRST_INIT=0` (as the console, only if its lane
+/// runs). Beside [`wave64_fix`]: that one stores starting values at the program's start but
+/// only where every LDS write and atomic of the program is known (an accumulator's), this one
+/// at the set-up's own place, whatever else the program does with its LDS.
+pub fn lds_first_init() -> bool {
+    !std::env::var("VICTORY_LDS_FIRST_INIT").is_ok_and(|v| v.trim() == "0")
+}
+
 /// The value an LDS dword must start with for the atomic `name` to accumulate into it, `None`
 /// for an atomic that is no such accumulation.
 fn identity(name: &str) -> Option<u32> {
