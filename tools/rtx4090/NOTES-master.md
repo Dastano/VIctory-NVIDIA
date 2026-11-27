@@ -105,3 +105,7 @@ Same walking route as r47, `-Fps 30`:
 
 So the launcher now makes frame generation ready only with `-FrameGen` (or `-FrameGenReady` for the F1 menu's
 live switch). trustno1's launcher defaults to `-Fps 1000` (no cap); `-Fps 30` holds the title's own rate.
+
+| r52 | final master, `-Fps 1000` (no cap), at the window | 33.6 / 31.6 (last 2 min) | - | - |
+
+The launcher default is `-Fps 30` here (most even frame times); `-Fps 1000` uncaps.

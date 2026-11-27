@@ -32,9 +32,10 @@ param(
     # and changes its amount while playing, with -FrameGenReady. Without it, only with -FrameGen: made ready but
     # off it cost about 1 fps walking on an RTX 4090 (tools/rtx4090/NOTES-master.md, r49/r50).
     [switch]$FrameGenReady,
-    # Frames begin every 1/Fps s whatever the title asks (it asks 1/30). 1000, the default: no cap, a frame
-    # begins as soon as the last is done. 30: the title's own rate.
-    [ValidateRange(1, 1000)][int]$Fps = 1000,
+    # Frames begin every 1/Fps s whatever the title asks (it asks 1/30). 30, the default here: the title's own
+    # rate, the most even frame times (RTX 4090: 30.0 held at the cell window). 1000: no cap, a frame begins as
+    # soon as the last is done (r52: 33.6 fps at the window, frame times less even).
+    [ValidateRange(1, 1000)][int]$Fps = 30,
     [hashtable]$More = @{},
     # Instead of playing: translate the shaders (-Shaders) and/or make the pipelines ahead (-Warm; -Used: only
     # those earlier runs drew with), with exactly the switches a run with the same options sets.
