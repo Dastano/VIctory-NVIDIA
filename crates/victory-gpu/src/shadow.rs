@@ -105,6 +105,8 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// Whether lists read it frozen, and its counters (`crate::freeze`).
+    pub(crate) freeze: crate::freeze::State,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -3387,7 +3389,15 @@ impl Shadow {
     /// and keeps the copy alive until the list is reset.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
         let len = len.min(self.start + self.len - address);
-        list.defer_refresh(self, address as usize, len as usize);
+        list.defer_refresh(self, address as usize, len as usize, true);
+    }
+
+    /// As [`Shadow::refresh`], always as a refresh step of its own, frozen
+    /// or not (`crate::freeze`): for copies the list itself copies from or
+    /// into on the card at this place, which need the step where it is.
+    pub(crate) fn refresh_live(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+        let len = len.min(self.start + self.len - address);
+        list.defer_refresh(self, address as usize, len as usize, false);
     }
 
     /// The bytes of the host buffer.
@@ -3431,6 +3441,7 @@ impl Shadow {
             wc: AtomicU8::new(0),
             mapped: false,
             place: None,
+            freeze: Default::default(),
         }
     }
 
@@ -3451,6 +3462,8 @@ impl Shadow {
     /// before the submission (a copy per declared range and submission);
     /// a GPU-side dirty mask would save that if big ranges make it slow.
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+        // Shaders write it: never frozen (`crate::freeze`).
+        self.freeze.never();
         // In place the shaders write title memory itself: no snapshot, no
         // compare, nothing to copy back, and no wait on its account.
         // shortcut: another host copy of the same bytes (a title buffer
@@ -3687,6 +3700,7 @@ impl Shadow {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::BackSyncUs, syncing.elapsed().as_micros() as u64);
         }
+        self.freeze.shader_found(written);
         written
     }
 
@@ -3764,7 +3778,9 @@ impl Shadow {
         if !merge_piece(now, held, title) {
             return 0;
         }
-        put_changed(start + at, &was, title)
+        let written = put_changed(start + at, &was, title);
+        self.freeze.shader_found(written);
+        written
     }
 
     /// The 64 KiB pieces (cut at multiples of 64 KiB of title memory) of
@@ -4149,6 +4165,12 @@ impl Shadow {
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
+        let copied = self.update_any(address, len);
+        self.freeze.copied(copied);
+        copied
+    }
+
+    fn update_any(&self, address: usize, len: usize) -> usize {
         // In place: the card reads title memory itself.
         if self.place.is_some() {
             return 0;
@@ -4819,6 +4841,7 @@ impl Shadow {
         }
         // The card's side and its "before" take the result.
         self.card_changed(at, at + n);
+        self.freeze.shader_found(written);
         written
     }
 
@@ -4881,7 +4904,9 @@ impl Shadow {
         if !mapped || !changed {
             return 0;
         }
-        put_changed(start + at, &was, title)
+        let written = put_changed(start + at, &was, title);
+        self.freeze.shader_found(written);
+        written
     }
 }
 
@@ -5356,6 +5381,19 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
         crate::host::retire(shadow);
     }
     n
+}
+
+/// Every copy the tables hold (title buffers' and windows'), for the
+/// busiest copies' line (`crate::freeze`).
+pub(crate) fn each_copy(mut f: impl FnMut(&Arc<Shadow>)) {
+    for entry in buffers_read().values() {
+        if let Some(shadow) = &entry.shadow {
+            f(shadow);
+        }
+    }
+    for shadow in LOOSE.read().unwrap_or_else(|e| e.into_inner()).values() {
+        f(shadow);
+    }
 }
 
 /// For the in-place census (`crate::inplace`): the title buffers (start,

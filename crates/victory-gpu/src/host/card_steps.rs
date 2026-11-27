@@ -938,6 +938,12 @@ fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(u
                     from: *at,
                     to: *at + *len,
                 },
+                // (A frozen copy may be refreshed here: its whole span, as
+                // `crate::freeze` does.)
+                Step::Frozen(shadow) => match shadow.freeze.span() {
+                    Some((from, to)) => Does::Refresh { shadow: Arc::as_ptr(shadow) as usize, from, to },
+                    None => continue,
+                },
                 Step::Run(_) => Does::Run,
                 Step::Placed(p) => Does::Placed { dst: p.dst, src: p.src, len: p.len },
                 Step::GpuWrite(..) | Step::Host(..) => continue,
@@ -1384,7 +1390,7 @@ impl Host {
             }
         }
         for (shadow, from, to) in spans.into_values() {
-            shadow.refresh(&own.list, from as u64, (to - from) as u64);
+            shadow.refresh_live(&own.list, from as u64, (to - from) as u64);
         }
         let mut copied = Vec::new();
         for op in &ops {

@@ -216,13 +216,13 @@ impl HostList {
         };
         let at = to.offset(dst as u64);
         // What the title's CPU wrote around and under it so far goes first.
-        to.refresh(self, dst as u64, len as u64);
+        to.refresh_live(self, dst as u64, len as u64);
         // SAFETY (both): an open list; live buffers (the list holds the
         // copies and its scratch memory), ranges inside them.
         unsafe { wait_for_all(host, &self.list) };
         match (&own, &scratch) {
             (Some(from), _) => {
-                from.refresh(self, src as u64, len as u64);
+                from.refresh_live(self, src as u64, len as u64);
                 let offset = from.offset(src as u64);
                 if from.buffer.as_raw() == to.buffer.as_raw() {
                     let Some(between) = self.between(host, len as u64) else {
@@ -271,7 +271,7 @@ impl HostList {
         let host = host()?;
         let from = shaders_own(src, len)?;
         let between = self.between(host, len as u64)?;
-        from.refresh(self, src as u64, len as u64);
+        from.refresh_live(self, src as u64, len as u64);
         STATS[3].fetch_add(1, Ordering::Relaxed);
         // SAFETY: an open list; live buffers, ranges inside them.
         unsafe {

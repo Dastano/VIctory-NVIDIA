@@ -2585,6 +2585,10 @@ enum Step {
     /// A title buffer copy that the list does on the card ([`place`]): what
     /// is done on the CPU for it.
     Placed(place::Placed),
+    /// A frozen host copy is read from here on (`crate::freeze`): it is
+    /// looked at in front of the submission, and refreshed here only if a
+    /// step before this one in the submission wrote title memory.
+    Frozen(std::sync::Arc<crate::shadow::Shadow>),
 }
 
 /// What a list does on the CPU when it is submitted: copies between host
@@ -2611,6 +2615,12 @@ struct Deferred {
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize), std::hash::BuildHasherDefault<AddressHash>>,
+    /// The host copies the list reads frozen (`crate::freeze`), each once,
+    /// and their addresses; those of them it has a [`Step::Frozen`] for
+    /// since the last title copy.
+    frozen: Vec<std::sync::Arc<crate::shadow::Shadow>>,
+    frozen_keys: std::collections::HashSet<usize, std::hash::BuildHasherDefault<AddressHash>>,
+    frozen_here: std::collections::HashSet<usize, std::hash::BuildHasherDefault<AddressHash>>,
     /// Ranges declared written by shaders since the list last wrote title
     /// memory (host copy, address, bytes): declaring them again would
     /// change nothing.
@@ -2692,6 +2702,7 @@ impl Deferred {
     /// date before them is not any more.
     fn title_written(&mut self) {
         self.refreshed.clear();
+        self.frozen_here.clear();
         self.gpu_written.clear();
         self.filled.clear();
     }
@@ -3401,7 +3412,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         return Some(WHY_READ);
                     }
                 },
-                Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(..) => {}
+                Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(..) | Step::Frozen(..) => {}
             }
         }
     }
@@ -6134,11 +6145,19 @@ impl Host {
         let mut settled = std::time::Duration::ZERO;
         // One write-watch asking for everything the submission refreshes
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
+        // The copies the lists read frozen (`crate::freeze`): asked about
+        // with the rest, looked at in front of the steps below.
+        batch.gather_frozen(runs);
         if crate::watch::once() {
             batch.copy_spans(runs);
-            let Batch { spans, ranges, .. } = &mut batch;
+            // A copy read frozen that shaders were declared to write since
+            // (a list recorded before that was submitted after it): looked
+            // at for flights' writes as the copies refreshed are.
+            batch.frozen_written_spans();
+            let Batch { spans, ranges, frozen, .. } = &mut batch;
             ranges.clear();
             ranges.extend(spans.iter().filter(|s| s.0.asked_ahead()).map(|s| (s.1, s.2)));
+            ranges.extend(frozen.iter().filter(|s| s.asked_ahead()).filter_map(|s| s.freeze.span()));
             SPLIT[8].fetch_add(split.so_far(), Ordering::Relaxed);
             stage.next("submit: asking the write watch");
             crate::watch::ask_once(&batch.ranges);
@@ -6165,6 +6184,7 @@ impl Host {
             self.settle(&mut submitted, WHY_STALE);
             settled += settling.elapsed();
         }
+        batch.front_frozen(this_submission);
         split.part(1);
         // What flights in the air may write.
         let air = line().written.clone();
@@ -7678,12 +7698,28 @@ impl HostList {
     /// Brings `[address, address + len)` of a buffer's host copy up to date
     /// when the list is submitted (once per range until a title copy
     /// intervenes), keeping the copy alive until the list is reset.
+    ///
+    /// With `may_freeze` and the copy frozen (`crate::freeze`): no refresh
+    /// step, only the copy noted as read here.
     pub(crate) fn defer_refresh(
         &self,
         shadow: &std::sync::Arc<crate::shadow::Shadow>,
         address: usize,
         len: usize,
+        may_freeze: bool,
     ) {
+        shadow.freeze.asked(address, address + len);
+        if may_freeze && shadow.freeze.reads_frozen(shadow.written(), shadow.in_place()) {
+            let key = std::sync::Arc::as_ptr(shadow) as usize;
+            let mut deferred = self.deferred();
+            if deferred.frozen_keys.insert(key) {
+                deferred.frozen.push(shadow.clone());
+            }
+            if deferred.frozen_here.insert(key) {
+                deferred.copies.push(Step::Frozen(shadow.clone()));
+            }
+            return;
+        }
         let mut deferred = self.deferred();
         let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
         if deferred.refreshed.insert(key) {
@@ -8156,6 +8192,7 @@ impl HostList {
                     {
                         copies += 1;
                     }
+                    batch.title_steps += 1;
                     batch.fill();
                     // (Only the refreshes it touches: `passes_keep`.)
                     batch.copy_written(dst, len);
@@ -8181,6 +8218,9 @@ impl HostList {
                         copies += 1;
                     }
                     crate::port::filled(src, len);
+                    if crate::freeze::fills_on() {
+                        crate::freeze::fill(src, len);
+                    }
                     if wide_fills() {
                         batch.fills.push((dst, src, len));
                         bytes += len as u64;
@@ -8192,6 +8232,7 @@ impl HostList {
                 }
                 Step::Placed(p) => {
                     let started = std::time::Instant::now();
+                    batch.title_steps += 1;
                     if crate::heap_marks::on() && crate::descriptor::in_shader_heap(p.dst, p.len) {
                         crate::heap_marks::prep_wrote();
                     }
@@ -8216,11 +8257,16 @@ impl HostList {
                     batch.add(shadow, *address, *len);
                     continue;
                 }
+                Step::Frozen(shadow) => {
+                    batch.frozen_step(shadow);
+                    continue;
+                }
                 Step::Run(work) | Step::Host(work, _) => {
                     batch.fill();
                     #[cfg(feature = "diagnostics")]
                     let started = std::time::Instant::now();
                     if matches!(step, Step::Run(_)) {
+                        batch.title_steps += 1;
                         batch.title_written();
                         // (It may write anywhere, a heap's records too.)
                         if crate::heap_marks::on() {
@@ -8671,6 +8717,13 @@ struct Batch {
     skipped: ByCopy<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     /// How many of `skipped` were left out (for tests; also in [`FEWER`]).
     left_out: usize,
+    /// The host copies the submission's lists read frozen, each once
+    /// (`crate::freeze`), and where each (by address) is in it.
+    frozen: Vec<std::sync::Arc<crate::shadow::Shadow>>,
+    frozen_at: ByCopy<usize>,
+    /// The steps that wrote title memory so far in the submission: a
+    /// [`Step::Frozen`] behind one is refreshed there.
+    title_steps: u32,
 }
 
 /// `VICTORY_FEWER_PAST_COPIES` (read here; on by default, `=0` as before):
@@ -9253,6 +9306,9 @@ impl Batch {
         self.ahead_asked = 0;
         self.skipped.clear();
         self.left_out = 0;
+        self.frozen.clear();
+        self.frozen_at.clear();
+        self.title_steps = 0;
         SPARE_BATCH.set(Some(self));
     }
 
@@ -9446,8 +9502,69 @@ impl Batch {
         SPLIT[10].fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Brings `[from, to)` of a copy up to date, timed.
-    fn update(shadow: &crate::shadow::Shadow, from: usize, to: usize) {
+    /// The copies `runs` read frozen (`crate::freeze`), each once, into
+    /// [`Batch::frozen`].
+    fn gather_frozen(&mut self, runs: &[&HostList]) {
+        self.frozen.clear();
+        self.frozen_at.clear();
+        if !crate::freeze::on() {
+            return;
+        }
+        for list in runs {
+            for copy in &list.deferred().frozen {
+                if let std::collections::hash_map::Entry::Vacant(place) = self.frozen_at.entry(std::sync::Arc::as_ptr(copy) as usize) {
+                    place.insert(self.frozen.len());
+                    self.frozen.push(copy.clone());
+                }
+            }
+        }
+    }
+
+    /// The copies read frozen that shaders were declared to write since
+    /// their lists were recorded join [`Batch::spans`] with their spans.
+    fn frozen_written_spans(&mut self) {
+        for copy in &self.frozen {
+            let Some((from, to)) = copy.freeze.span().filter(|_| copy.written()) else {
+                continue;
+            };
+            match self.spans_at.entry(std::sync::Arc::as_ptr(copy) as usize) {
+                std::collections::hash_map::Entry::Occupied(at) => {
+                    let span = &mut self.spans[*at.get()];
+                    (span.1, span.2) = (span.1.min(from), span.2.max(to));
+                }
+                std::collections::hash_map::Entry::Vacant(place) => {
+                    place.insert(self.spans.len());
+                    self.spans.push((copy.clone(), from, to));
+                }
+            }
+        }
+    }
+
+    /// In front of the steps, after the submission's one asking: the
+    /// copies read frozen are looked at, and refreshed where that does not
+    /// tell they copy nothing (`crate::freeze::front`).
+    fn front_frozen(&mut self, submission: u64) {
+        if self.frozen.is_empty() {
+            return;
+        }
+        crate::freeze::front(&self.frozen, submission, |copy, from, to| Self::update(copy, from, to));
+    }
+
+    /// A list reads `shadow` frozen from here on ([`Step::Frozen`]): it was
+    /// looked at in front of the steps ([`Batch::front_frozen`]); behind a
+    /// step that wrote title memory it is refreshed here, as its refresh
+    /// steps would have been, over the whole span asked of it.
+    fn frozen_step(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>) {
+        if self.title_steps > 0
+            && let Some((from, to)) = shadow.freeze.span()
+        {
+            crate::freeze::refreshed_after_write();
+            self.add(shadow, from, to - from);
+        }
+    }
+
+    /// Brings `[from, to)` of a copy up to date, timed; the bytes copied.
+    fn update(shadow: &crate::shadow::Shadow, from: usize, to: usize) -> usize {
         let started = std::time::Instant::now();
         let _one = crate::timeline::span("a copy's refresh");
         let copied = shadow.update(from, to - from);
@@ -9459,6 +9576,7 @@ impl Batch {
         crate::copystat::range(from, to - from, us, 0);
         PREPARING[0].fetch_add(us, Ordering::Relaxed);
         PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+        copied
     }
 
     /// Whether `staging` is still to be refreshed in this submission (and
@@ -9877,7 +9995,11 @@ impl Batch {
                 let jobs: Vec<Box<dyn FnOnce() + Send>> = self
                     .refreshes
                     .drain(..)
-                    .map(|(shadow, from, to)| Box::new(move || Self::update(&shadow, from, to)) as Box<dyn FnOnce() + Send>)
+                    .map(|(shadow, from, to)| {
+                        Box::new(move || {
+                            Self::update(&shadow, from, to);
+                        }) as Box<dyn FnOnce() + Send>
+                    })
                     .collect();
                 crate::shadow::wide_run(jobs);
             }
@@ -10501,6 +10623,7 @@ impl Meter {
         );
         crate::indirect::merge::line(frames);
         crate::shadow::exact_line(frames);
+        crate::freeze::line(frames);
         crate::descriptor::sync_line(frames);
         late_line(frames);
         crate::queue::behind_line(frames);
@@ -12125,6 +12248,296 @@ mod refresh_tests {
         crate::watch::PORT_GUARD_IN_TEST.set(true);
         refreshed_ranges_hold_title_memory();
         crate::watch::PORT_GUARD_IN_TEST.set(false);
+    }
+
+    /// Tests that freeze copies (`crate::freeze`), one at a time: the frame
+    /// is the process's.
+    static FREEZING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Freezing on for this thread while it lives.
+    struct Freezing(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+    impl Freezing {
+        fn on() -> Freezing {
+            let one = FREEZING.lock().unwrap_or_else(|e| e.into_inner());
+            crate::freeze::IN_TEST.set(true);
+            Freezing(one)
+        }
+
+        fn next_frame() {
+            crate::freeze::TEST_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    impl Drop for Freezing {
+        fn drop(&mut self) {
+            crate::freeze::IN_TEST.set(false);
+        }
+    }
+
+    type Ranges = Vec<(Arc<Shadow>, usize, usize)>;
+
+    /// A list's reads as `HostList::defer_refresh` records them: the live
+    /// ones as refreshes, each frozen copy once.
+    fn record(ranges: &[(Arc<Shadow>, usize, usize)]) -> (Ranges, Vec<Arc<Shadow>>) {
+        let (mut live, mut frozen) = (Vec::new(), Vec::<Arc<Shadow>>::new());
+        for (shadow, at, len) in ranges {
+            shadow.freeze.asked(*at, at + len);
+            if shadow.freeze.reads_frozen(shadow.written(), shadow.in_place()) {
+                if !frozen.iter().any(|f| Arc::ptr_eq(f, shadow)) {
+                    frozen.push(shadow.clone());
+                }
+            } else {
+                live.push((shadow.clone(), *at, *len));
+            }
+        }
+        (live, frozen)
+    }
+
+    /// Prepares a submission of what [`record`] gave, as `Host::submit`
+    /// does: one asking for the live ranges and the frozen spans, the frozen
+    /// copies looked at in front, the refreshes in flushes. With `copy`, a
+    /// title buffer copy of those bytes to that address is one of the steps,
+    /// as `run_deferred` does it, and the lists read everything again behind
+    /// it (the frozen copies by their `Step::Frozen`).
+    fn frozen_submission(
+        live: &[(Arc<Shadow>, usize, usize)],
+        frozen: &[Arc<Shadow>],
+        flushes: usize,
+        copy: Option<(usize, Vec<u8>)>,
+    ) {
+        let _one = SUBMITTING.lock().unwrap_or_else(|e| e.into_inner());
+        let mut asked: Vec<(usize, usize)> = live.iter().filter(|r| !r.0.unwatched()).map(|r| (r.1, r.1 + r.2)).collect();
+        asked.extend(frozen.iter().filter(|s| !s.unwatched()).filter_map(|s| s.freeze.span()));
+        crate::watch::ask_once(&asked);
+        let mut batch = Batch::default();
+        batch.frozen = frozen.to_vec();
+        batch.front_frozen(1);
+        for part in live.chunks(live.len().div_ceil(flushes).max(1)) {
+            for (shadow, at, len) in part {
+                batch.add(shadow, *at, *len);
+            }
+            batch.flush();
+        }
+        if let Some((at, bytes)) = copy {
+            batch.title_steps += 1;
+            batch.fill();
+            batch.copy_written(at, bytes.len());
+            super::copy_mapped(at as *mut u8, bytes.as_ptr(), bytes.len(), true);
+            crate::watch::wrote(at, bytes.len());
+            for shadow in frozen {
+                batch.frozen_step(shadow);
+            }
+            for (shadow, at, len) in live {
+                batch.add(shadow, *at, *len);
+            }
+            batch.flush();
+        }
+        crate::watch::ask_once_end();
+    }
+
+    /// Two views of one section, as the title shows a page at two addresses.
+    fn two_views(len: usize) -> (usize, usize) {
+        // SAFETY: a section of our own, mapped twice (never given back).
+        unsafe {
+            let section =
+                CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, len as u32, std::ptr::null());
+            crate::title_memory_section(section as usize, len as u64, true);
+            let views = [0, 1].map(|_| {
+                let at = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, len).Value as usize;
+                assert_ne!(at, 0);
+                crate::title_memory_remapped(at, len);
+                crate::title_memory_view(at, len, section as usize, 0);
+                at
+            });
+            (views[0], views[1])
+        }
+    }
+
+    /// With copies frozen: whatever is written where between the lists'
+    /// recording and their submission (by the title, through another view
+    /// of the page, by the kernel, by a landing of what shaders wrote) or
+    /// during it (a title buffer copy among the steps), every range a list
+    /// reads, frozen or live, holds what title memory holds once the
+    /// submission is prepared. Quiet stretches let copies freeze; writes
+    /// thaw them, and ban some.
+    #[test]
+    fn frozen_copies_hold_title_memory() {
+        let _freezing = Freezing::on();
+        // SAFETY (all blocks): title memory and copies of the test's own.
+        let mut random = Random(0x0BAD_F00D_DEAD_BEEF);
+        const LEN: usize = 24 * PAGE;
+        let (seen, other) = two_views(LEN);
+        let regions = [title(LEN, false), title(LEN, true), seen];
+        // Where writes go: the regions, and the other view of the third.
+        let written = [regions[0], regions[1], other];
+        let mut copies = Vec::new();
+        for &region in &regions {
+            for (from, to) in [(0, LEN), (100, LEN - 5000), (3 * PAGE + 777, 9 * PAGE + 10), (8 * PAGE, 8 * PAGE + 300), (PAGE, 20 * PAGE)] {
+                let data = memory(to - from);
+                copies.push((Shadow::unbacked((region + from) as u64, data, (to - from) as u64, false), data));
+            }
+        }
+        let byte = |at: usize| unsafe { (at as *const u8).read_volatile() };
+        let (mut read_frozen, mut thawed) = (0, 0);
+        let mut was_frozen = vec![false; copies.len()];
+        for round in 0..1500 {
+            Freezing::next_frame();
+            // Quiet stretches of 60 frames, then 40 that write.
+            let writing = round % 100 >= 60;
+            let mut ranges = Vec::new();
+            for (shadow, _) in &copies {
+                if random.below(4) == 0 {
+                    continue;
+                }
+                let (start, len) = shadow.span();
+                let (start, len) = (start as usize, len as usize);
+                let from = if random.below(2) == 0 { 0 } else { random.below(len) };
+                let n = if random.below(2) == 0 { len - from } else { 1 + random.below(len - from) };
+                ranges.push((shadow.clone(), start + from, n));
+            }
+            if ranges.is_empty() {
+                continue;
+            }
+            let (live, frozen) = record(&ranges);
+            read_frozen += frozen.len();
+            // After the recording, before the submission.
+            for _ in 0..if writing { 1 + random.below(4) } else { 0 } {
+                let at = written[random.below(3)] + random.below(LEN - 64);
+                let n = 1 + random.below(60);
+                match random.below(4) {
+                    0 => {
+                        // What shaders wrote, landed.
+                        let was: Vec<u8> = (0..n).map(|i| byte(at + i)).collect();
+                        let now: Vec<u8> = was.iter().map(|b| b.wrapping_add(1 + random.below(255) as u8)).collect();
+                        Shadow::put(at, &was, &now);
+                    }
+                    1 => {
+                        // The kernel's write, which no guard sees.
+                        let kernel = crate::watch::kernel_writing(at, n);
+                        for i in 0..n {
+                            unsafe { ((at + i) as *mut u8).write_volatile(random.below(256) as u8) };
+                        }
+                        drop(kernel);
+                    }
+                    _ => {
+                        for i in 0..n {
+                            unsafe { ((at + i) as *mut u8).write_volatile(random.below(256) as u8) };
+                        }
+                    }
+                }
+            }
+            let copy = (writing && random.below(3) == 0).then(|| {
+                let at = regions[random.below(3)] + random.below(LEN - 64);
+                (at, (0..1 + random.below(60)).map(|_| random.below(256) as u8).collect::<Vec<u8>>())
+            });
+            frozen_submission(&live, &frozen, 1 + random.below(3), copy);
+            for (shadow, at, n) in &ranges {
+                let data = copies.iter().find(|c| Arc::ptr_eq(&c.0, shadow)).unwrap().1;
+                let start = shadow.span().0 as usize;
+                let same = unsafe {
+                    std::slice::from_raw_parts(*at as *const u8, *n) == std::slice::from_raw_parts(data.add(at - start), *n)
+                };
+                let frozen = frozen.iter().any(|f| Arc::ptr_eq(f, shadow));
+                assert!(same, "round {round}: {at:#x}+{n:#x} of a copy at {start:#x} (read frozen: {frozen})");
+            }
+            for (i, (shadow, _)) in copies.iter().enumerate() {
+                let now = shadow.freeze.frozen();
+                if was_frozen[i] && !now {
+                    thawed += 1;
+                }
+                was_frozen[i] = now;
+            }
+        }
+        assert!(read_frozen > 1000, "copies were read frozen {read_frozen} times");
+        assert!(thawed > 0, "no copy thawed");
+    }
+
+    /// A copy unchanged for the frames asked freezes; written after a list
+    /// recorded it, it is refreshed in front of the submission and thawed;
+    /// frozen again and thawed a second time within 120 frames, it is
+    /// banned and never frozen again. One that shaders write is banned.
+    #[test]
+    fn a_frozen_copy_thaws_and_is_banned_when_thawed_twice() {
+        let _freezing = Freezing::on();
+        const LEN: usize = 4 * PAGE;
+        let region = title(LEN, false);
+        let data = memory(LEN);
+        let copy = Shadow::unbacked(region as u64, data, LEN as u64, false);
+        let held = || unsafe { std::slice::from_raw_parts(region as *const u8, LEN) == std::slice::from_raw_parts(data, LEN) };
+        // Frames until it is read frozen (bounded), each submitted.
+        let until_frozen = |most: usize| -> Option<usize> {
+            for frame in 0..most {
+                Freezing::next_frame();
+                let (live, frozen) = record(&[(copy.clone(), region, LEN)]);
+                frozen_submission(&live, &frozen, 1, None);
+                assert!(held());
+                if !frozen.is_empty() {
+                    return Some(frame);
+                }
+            }
+            None
+        };
+        let thaw = |value: u8| {
+            Freezing::next_frame();
+            let (live, frozen) = record(&[(copy.clone(), region, LEN)]);
+            assert_eq!((live.len(), frozen.len()), (0, 1), "read frozen");
+            // Written after the recording: the submission must see it.
+            unsafe { ((region + PAGE + 5) as *mut u8).write_volatile(value) };
+            frozen_submission(&live, &frozen, 1, None);
+            assert!(held(), "the frozen copy was refreshed in front of the submission");
+            assert!(!copy.freeze.frozen(), "thawed");
+        };
+        let first = until_frozen(100).expect("frozen within 100 frames");
+        assert!(first >= 29, "frozen after {first} frames, before 30");
+        assert!(copy.freeze.frozen());
+        thaw(1);
+        assert!(!copy.freeze.banned());
+        until_frozen(100).expect("frozen again");
+        thaw(2);
+        assert!(copy.freeze.banned(), "thawed twice within 120 frames");
+        assert_eq!(until_frozen(300), None, "banned copies are never frozen");
+        // Shaders declared to write another one: never frozen.
+        let data = memory(LEN);
+        let written = Shadow::unbacked(region as u64, data, LEN as u64, false);
+        written.freeze.never();
+        for _ in 0..100 {
+            Freezing::next_frame();
+            let (_, frozen) = record(&[(written.clone(), region, LEN)]);
+            assert!(frozen.is_empty());
+        }
+    }
+
+    /// A title buffer copy among a submission's steps writes into a frozen
+    /// copy's memory after the look in front: the copy's `Step::Frozen`
+    /// behind it refreshes it there, of write-watched memory and of a view
+    /// of a page another view of which is written.
+    #[test]
+    fn a_title_copy_among_the_steps_reaches_frozen_copies_behind_it() {
+        let _freezing = Freezing::on();
+        const LEN: usize = 4 * PAGE;
+        let (seen, _) = two_views(LEN);
+        for region in [title(LEN, false), title(LEN, true), seen] {
+            let data = memory(LEN);
+            let copy = Shadow::unbacked(region as u64, data, LEN as u64, false);
+            let held = || unsafe { std::slice::from_raw_parts(region as *const u8, LEN) == std::slice::from_raw_parts(data, LEN) };
+            let mut frozen = Vec::new();
+            for _ in 0..100 {
+                Freezing::next_frame();
+                let (live, now) = record(&[(copy.clone(), region, LEN)]);
+                frozen_submission(&live, &now, 1, None);
+                if !now.is_empty() {
+                    frozen = now;
+                    break;
+                }
+            }
+            assert_eq!(frozen.len(), 1, "frozen");
+            Freezing::next_frame();
+            let (live, frozen) = record(&[(copy.clone(), region, LEN)]);
+            assert_eq!((live.len(), frozen.len()), (0, 1));
+            frozen_submission(&live, &frozen, 1, Some((region + 2 * PAGE + 40, vec![0x5A; 100])));
+            assert!(held(), "the copy among the steps reached the frozen copy behind it");
+        }
     }
 
     /// `VICTORY_REFRESH_WIDE` moves only where and when a flush's refreshes
