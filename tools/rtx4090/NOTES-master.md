@@ -233,3 +233,14 @@ r89 (r88 + `VICTORY_EARLY_ALL=1`, every title pipeline started at creation): 39.
 under 29.5 (r88: 13 of 90), over 50 ms 260 (257), longest 667 ms: within noise; left off. `warm --used` found all
 83,821 booked pipelines already made: the first-use bursts at area loads (1,561 shaders in 5 s in a user session)
 are loads, not compiles.
+
+## Diagnostics run and the last knobs (r90-r92)
+
+r90 (the diagnostics build at the release path, walking, DLSS Quality, no cap; 39.0 fps): in slow seconds versus
+fast ones the card is idle 12.7 vs 2.4 ms a frame (half behind our submitting thread, half while the title had
+not submitted), the title waits 13.3 vs 5.9 ms at presents, the write trackers' locks are waited on 19.1 vs 2.0
+ms (all threads; page faults 2,591 vs 377 a frame), flights are waited for over upload-memory fills the card
+steps refused (2.0 vs 0.18 ms, peaks of 15), and the copy-back relay lands 13.8 vs 5.6 ms. The draws are 5,369
+vs 1,654: about half the extra frame time is real extra content.
+r91 (`VICTORY_SUBMIT_FRAMES=2`): 39.1 fps, 11 lines under 29.5: no change. r92 (`VICTORY_PORT_GUARD=0`,
+`VICTORY_FAULT_UNLOCKED=1`): 37.7 fps, 16 under 29.5: worse; port 6 stays.
