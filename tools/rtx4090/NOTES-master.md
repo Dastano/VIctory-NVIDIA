@@ -123,3 +123,14 @@ The F1 menu's WATER LIGHT (`VICTORY_WATER_LIGHT=1`) runs the water's two tiled l
 form on 32-lane waves, which leaves whole tiles of open water black; off by default. Memory (r56): private bytes
 9.9 GB at the start, ~35 GB after three minutes in the world, flat for the rest of the 11 minutes; a 50-minute play
 session reached 59 GB (commit 84 of 89 GB, heavy paging), so it grows with places visited.
+
+## Frame generation: open (r61-r65)
+
+After the water fix (fix/water: one-thread LDS accumulator inits hoisted, `VICTORY_WAVE64_FIX`, on; the water's
+tiled light runs on 32-lane hosts again) every frame-generation run at the cell window locked at 15 rendered /
+30 shown, the presenting thread 40-50 ms inside Streamline's present: r61 (default), r62 (`-Fps 1000`), r63
+(borderless fullscreen), r64 (`VICTORY_WAVE64_FIX=0`, water light off). r60 (walking route, build before the
+water merge) ran 27 rendered / ~55 shown. r65 (walking route, current build) never reached the world: Streamline
+raised an exception every ~225 ms (83 mini-dumps) and the title ended; no other run had one. Not resolved.
+Without frame generation (r59: DLAA, walking) the build runs 28.8 fps with no such lock. Recommendation for now:
+DLAA, frame generation off.
