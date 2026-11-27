@@ -155,3 +155,9 @@ fps, over 50 ms 396, one 5-second hitch. r70 (+ `VICTORY_PASSES_HOT=1`, helpers 
 r71 (`VICTORY_TEXREF_PARTIAL`: textures detiled only in the rows whose bytes changed): 29.15 fps mean, over 50 ms
 300, longest 464 ms; preparing 18.7 ms (r70: 19.0): within noise of r70. Its shots reach the top-down view of the
 boat on open water: no black blocks with the water's tiled light left out (the default again); no texture faults.
+
+r72 (`VICTORY_FG_PACING_FIX`: 3 buffers, tearing): still 15 rendered / 30 shown, 44-51 ms in the present. Likely
+cause outside the layer: on this PC the 3440x1440 monitor is driven by the CPU's integrated AMD Radeon, not the
+RTX 4090, and a Parsec virtual display is the primary display; every frame crosses adapters, and frame generation
+(which paces presents on the display it is connected to) cannot pace across that. To check with the monitor on
+the 4090.
