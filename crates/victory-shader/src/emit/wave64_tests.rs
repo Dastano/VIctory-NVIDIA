@@ -1096,3 +1096,124 @@ fn the_console_threads_of_a_two_dimensional_group_are_each_given_once() {
     }
     eprintln!("ran on the hardware device: 64 of 64 console threads, each once");
 }
+
+/// The underwater volumetrics (`water_shading:CS_TransmissionVolumetricsSubmerged`, groups of
+/// 64, one console wave): a per-lane loop, then an LDS write and a read of the other half's
+/// dword in one per-lane branch, then `v_readlane_b32` of lane 63. Lane t goes round its loop
+/// (t >> 4) + 1 times adding 3; the lanes below s0 then store their sum to LDS and add lane
+/// t ^ 63's dword (the sum, or t where that lane skipped the branch); every lane adds lane 63's
+/// sum and stores. The form with the loop's branches taken by each host wave together
+/// (`WAVE-LOOPS`) still wants 64 lanes, and its lowering names the branch whose LDS accesses
+/// not every lane runs: those blocks were forgotten, the widening ([`super::widen`]) began and
+/// ended with no branch taken wave-wide, and the program was dropped on 32-lane hosts. Kept
+/// (`VICTORY_WAVE64_WATER3`), the branch is taken wave-wide and it runs in waves of 32.
+#[test]
+fn a_loop_form_still_on_64_lanes_keeps_the_blocks_it_wants_every_lane_in() {
+    let words = [
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0: this lane's LDS dword
+        0x3A06_00BF, // v_xor_b32 v3, 63, v0
+        0x3406_0682, // v_lshlrev_b32 v3, 2, v3: lane t ^ 63's (the other half)
+        0xD834_0000,
+        0x0000_0001, // ds_write_b32 v1, v0: every lane, t
+        0x7E04_0300, // v_mov_b32 v2, v0
+        0x2C0E_0084, // v_lshrrev_b32 v7, 4, v0
+        0x4A0E_0E81, // v_add_nc_u32 v7, 1, v7: rounds (t >> 4) + 1
+        0x7E0A_0280, // v_mov_b32 v5, 0
+        0xBE8E_047E, // s_mov_b64 s[14:15], exec
+        0x4A04_0483, // loop: v_add_nc_u32 v2, 3, v2
+        0x4A0A_0A81, // v_add_nc_u32 v5, 1, v5
+        0x7DA8_0B07, // v_cmpx_gt_u32 exec, v7, v5: the lanes with rounds left
+        0xBF89_FFFC, // s_cbranch_execnz loop
+        0xBEFE_040E, // s_mov_b64 exec, s[14:15]
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0: t < s0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0006, // s_cbranch_execz past the branch
+        0xD834_0000,
+        0x0000_0201, // ds_write_b32 v1, v2
+        0xD8D8_0000,
+        0x0400_0003, // ds_read_b32 v4, v3
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x4A04_0902, // v_add_nc_u32 v2, v2, v4
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        0xD760_0007,
+        0x0001_7F02, // v_readlane_b32 s7, v2, 63
+        0x4A04_0407, // v_add_nc_u32 v2, s7, v2
+        0xE070_1000,
+        0x8002_0201, // buffer_store_dword v2, v1, s[8:11], 0 offen
+    ];
+    let mut native = native(&words);
+    if let StageIo::Cs(cs) = &mut native.io {
+        cs.rsrc2 |= 1 << 15; // 512 bytes of LDS
+    }
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let container = crate::dxbc::build(&[]);
+    let c = crate::Container::parse(&container).expect("container");
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let widen = |water3: bool| {
+        // SAFETY: tests that read this switch hold ONE_AT_A_TIME
+        unsafe { std::env::set_var("VICTORY_WAVE64_WATER3", if water3 { "1" } else { "0" }) };
+        lower::take_needs();
+        let r = super::widen(&c, &native, &p, false, false, false);
+        unsafe { std::env::remove_var("VICTORY_WAVE64_WATER3") };
+        r.expect("widen")
+    };
+    // as before: the loop form on 64 lanes, nothing named, nothing widened
+    let (_, old) = widen(false);
+    assert_eq!(old, Some(64));
+    let (shader, wave) = widen(true);
+    lower::TEST_HOST_WAVE.set(was);
+    assert_eq!(wave, Some(32));
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    // the console: one wave, its lanes in step
+    let console = |s0: u32| {
+        let mut sum: Vec<u32> = (0..64u32).map(|t| t + 3 * ((t >> 4) + 1)).collect();
+        let mut lds: Vec<u32> = (0..64).collect();
+        let on: Vec<usize> = (0..64).filter(|&t| (t as u32) < s0).collect();
+        for &t in &on {
+            lds[t] = sum[t];
+        }
+        for &t in &on {
+            sum[t] = sum[t].wrapping_add(lds[t ^ 63]);
+        }
+        let last = sum[63];
+        sum.iter().map(|&v| v.wrapping_add(last)).collect::<Vec<u32>>()
+    };
+    // (waves of 32: WARP's are 4 lanes and refuse it, `VICTORY_WARP=1` leaves it unrun)
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let (root, pso) = match host.compute_pipeline(&shader) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("the device does not take this program (waves of 32): {e}; not run");
+            return;
+        }
+    };
+    for s0 in [0u32, 1, 20, 32, 33, 50, 64] {
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            if let (RootType::Constants, 0, 0) = (u.root, u.slot, u.dword) {
+                ud[u.index as usize] = s0;
+            }
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(64)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+        assert_eq!(&out[0][..64], &console(s0)[..], "s0 = {s0}");
+    }
+    eprintln!("ran on the device: the loop, the branch taken wave-wide and lane 63's read, as the console runs them");
+}

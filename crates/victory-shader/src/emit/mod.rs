@@ -682,6 +682,14 @@ pub fn emit(
                     | [0x70, 0x99, 0xa5, 0x7f, 0xde, 0xd1, 0x42, 0x61, 0x3b, 0x44, 0xf4, 0x10, 0x46, 0x3d, 0x6b, 0xe6]
                     | [0xf1, 0xf1, 0x61, 0xe4, 0x7e, 0xef, 0xa3, 0x64, 0x69, 0x18, 0x39, 0xfd, 0x72, 0x06, 0xcc, 0xf6]
             )
+            // `CS_TransmissionVolumetrics` and `_VolumePortalsOnly` (1.0.2.1; 17 branches each)
+            || water3()
+                && matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64)
+                && matches!(
+                    c.digest,
+                    [0xc4, 0x0b, 0xd9, 0x53, 0x09, 0x6e, 0x88, 0x25, 0xce, 0x64, 0x50, 0xb5, 0x53, 0xf1, 0x23, 0x5c]
+                        | [0x4f, 0xa5, 0x83, 0x20, 0xd7, 0x61, 0xbf, 0x55, 0x81, 0x20, 0xf9, 0x2c, 0x19, 0xd3, 0x84, 0xaa]
+                )
             || matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 128)
                 && c.digest == [0x50, 0xcf, 0x28, 0x32, 0x8b, 0x58, 0x05, 0x3d, 0xa8, 0x9a, 0x8d, 0xa0, 0x1a, 0xa1, 0x23, 0xc6];
         let wide_on = wide_option.as_ref().map_or(scene_kernel, |v| v == "1");
@@ -942,6 +950,14 @@ fn widen(
 ///
 /// From foxhound 454ffea, as the skip kept around a loop that never ends with no lane left
 /// (`ir::without_skips`) and the first thread's LDS set-up (`VICTORY_LDS_FIRST_INIT`).
+/// Whether the three volumetric water programs that once kept 64-lane waves translate for
+/// hosts of 32 (`VICTORY_WAVE64_WATER3`, on unless `0`): `CS_TransmissionVolumetrics` and
+/// `_VolumePortalsOnly` with their branches taken wave-wide like the tiled ones, and the
+/// blocks a still-64-lane loop form names kept for [`widen`] (`..._Submerged`).
+fn water3() -> bool {
+    std::env::var("VICTORY_WAVE64_WATER3").map_or(true, |v| v.trim() != "0")
+}
+
 fn loops_wave(native: &NativeProgram) -> bool {
     if native.stage != HwStage::Cs {
         return false;
@@ -997,7 +1013,13 @@ fn emit_program(
             if why {
                 eprintln!("WAVE-LOOPS {} loop branches taken by each host wave together", loops.len());
             }
-            lower::take_needs();
+            // Still 64 lanes on a host of 32: the blocks this form wants every lane in are
+            // what [`widen`] takes wave-wide next, so they stay. (Forgotten before, the
+            // widening of `CS_TransmissionVolumetricsSubmerged` began and ended with no
+            // branch named, and the program was dropped: `VICTORY_WAVE64_WATER3=0`.)
+            if !(w == 64 && lower::host_max_wave() == 32 && water3()) {
+                lower::take_needs();
+            }
             Ok((shader, Some(w)))
         }
         other => {
