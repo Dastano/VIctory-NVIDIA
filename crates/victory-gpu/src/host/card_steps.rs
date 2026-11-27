@@ -392,16 +392,31 @@ fn elsewhere(does: &[Does], shadow: usize, from: usize, to: usize) -> bool {
 /// write is there: the one they all write it through, or without any the
 /// one shaders would be given.
 fn holder(writers: &[Writer], from: usize, to: usize) -> Result<Arc<Shadow>, &'static str> {
-    let mut found: Option<&Arc<Shadow>> = None;
-    for w in writers.iter().filter(|w| meet((w.from, w.to), (from, to))) {
-        match (&w.shadow, found) {
-            (None, _) => return Err("a read-back or a value behind a flight is written there"),
-            (Some(s), Some(f)) if !Arc::ptr_eq(s, f) => return Err("flights write it through two host copies"),
-            (Some(s), _) => found = Some(s),
+    let by = |w: &Writer| w.shadow.as_ref().map_or(0, |s| Arc::as_ptr(s) as usize);
+    let found = holding(writers.iter().map(|w| (by(w), w.from, w.to)), from, to)?;
+    let found = writers.iter().find_map(|w| w.shadow.as_ref().filter(|s| Arc::as_ptr(s) as usize == found));
+    held_in(found.cloned(), from, to)
+}
+
+/// What [`holder`] finds among `writers` (host copy by address, `0`: none;
+/// from; to), in their order: the host copy that all that write `[from,
+/// to)` write it through (`0`: none writes it), or why not.
+fn holding(writers: impl Iterator<Item = (usize, usize, usize)>, from: usize, to: usize) -> Result<usize, &'static str> {
+    let mut found = 0;
+    for (s, ..) in writers.filter(|w| meet((w.1, w.2), (from, to))) {
+        match s {
+            0 => return Err("a read-back or a value behind a flight is written there"),
+            s if found != 0 && s != found => return Err("flights write it through two host copies"),
+            s => found = s,
         }
     }
+    Ok(found)
+}
+
+/// The rest of [`holder`], with the host copy the writers write through.
+fn held_in(found: Option<Arc<Shadow>>, from: usize, to: usize) -> Result<Arc<Shadow>, &'static str> {
     let shadow = match found {
-        Some(s) => s.clone(),
+        Some(s) => s,
         None => crate::shadow::find(from as u64, (to - from) as u64).ok_or("no host copy of it")?,
     };
     let (start, len) = shadow.span();
@@ -409,6 +424,139 @@ fn holder(writers: &[Writer], from: usize, to: usize) -> Result<Arc<Shadow>, &'s
         return Err("no host copy holds all of it");
     }
     Ok(shadow)
+}
+
+/// Whether the steps given to the card are planned the quicker way
+/// (`VICTORY_CARD_PLAN_FAST`, on by default; `0`: as before): what holds
+/// the bytes a step reads is looked up in an index of what flights write
+/// ([`Writers`]) instead of a walk over all of it, and the fills' slots are
+/// found one list at a time instead of a list's lock per fill. The same
+/// steps go to the card, doing the same (`the_index_finds_what_the_walk_finds`):
+/// only the time differs. Also: the fills' descriptor slots are made with
+/// the heaps looked up once per thread, not once per slot.
+///
+/// Why: with 7,000-10,000 draws a frame the planning took 3-6 ms of the
+/// submitting thread a frame. Flights in the air declare thousands of
+/// ranges they write (each a host copy's reference counted once more for
+/// the planning), and each of a few hundred places a submission's fills
+/// read walked all of them.
+fn fast() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_PLAN_FAST").is_none_or(|v| v != "0"))
+}
+
+/// What flights in the air write, as [`writers`] and the line's landing
+/// give it, asked by place ([`fast`]): the greatest end over a tree of
+/// them by start. Copies done here, added as the planning goes on, are
+/// looked at one by one behind them.
+#[derive(Default)]
+struct Writers {
+    /// The host copies written through, by address.
+    shadows: ByCopy<Arc<Shadow>>,
+    /// Host copy by address (`0`: none), from, to: in [`writers`]' order.
+    all: Vec<(usize, usize, usize)>,
+    /// Places in `all` of those in the tree, by start, and their starts.
+    sorted: Vec<u32>,
+    starts: Vec<usize>,
+    /// The greatest end under each node (the root at 1, the leaves from
+    /// `leaves` on, in `sorted`'s order; ends of 0 beyond).
+    tree: Vec<usize>,
+    leaves: usize,
+    hits: Vec<u32>,
+}
+
+impl Writers {
+    fn of(line: &Line) -> Writers {
+        let mut w = Writers::default();
+        for item in &line.line {
+            match item {
+                Late::Run(flight) => {
+                    for (shadow, ranges) in &flight.back {
+                        let s = w.shadow(shadow);
+                        w.all.extend(ranges.iter().map(|&(from, to)| (s, from, to)));
+                    }
+                    for &i in &flight.order {
+                        for &(_, at, [row, rows, pitch]) in &flight.lists[i].host().deferred().backs {
+                            w.all.push((0, at, at + rows.saturating_sub(1) * pitch + row));
+                        }
+                    }
+                    for (shadow, from, to) in flight.own.iter().flat_map(|own| &own.copied) {
+                        let s = w.shadow(shadow);
+                        w.all.push((s, *from, *to));
+                    }
+                }
+                Late::Write(at, _, bytes) => w.all.push((0, *at, *at + *bytes)),
+                Late::Signal(..) => {}
+            }
+        }
+        for l in &line.landing {
+            let s = l.shadow.as_ref().map_or(0, |shadow| w.shadow(shadow));
+            w.all.push((s, l.from, l.to));
+        }
+        w.index();
+        w
+    }
+
+    fn shadow(&mut self, shadow: &Arc<Shadow>) -> usize {
+        let at = Arc::as_ptr(shadow) as usize;
+        self.shadows.entry(at).or_insert_with(|| shadow.clone());
+        at
+    }
+
+    /// The tree over all there is now.
+    fn index(&mut self) {
+        let n = self.all.len();
+        self.sorted = (0..n as u32).collect();
+        self.sorted.sort_unstable_by_key(|&k| self.all[k as usize].1);
+        self.starts = self.sorted.iter().map(|&k| self.all[k as usize].1).collect();
+        self.leaves = n.next_power_of_two();
+        self.tree = vec![0; 2 * self.leaves];
+        for (i, &k) in self.sorted.iter().enumerate() {
+            self.tree[self.leaves + i] = self.all[k as usize].2;
+        }
+        for node in (1..self.leaves).rev() {
+            self.tree[node] = self.tree[2 * node].max(self.tree[2 * node + 1]);
+        }
+    }
+
+    /// A copy done here writes `[from, to)` through `shadow`.
+    fn push(&mut self, shadow: &Arc<Shadow>, from: usize, to: usize) {
+        let s = self.shadow(shadow);
+        self.all.push((s, from, to));
+    }
+
+    /// [`holding`] over all of them, in their order.
+    fn holding(&mut self, from: usize, to: usize) -> Result<usize, &'static str> {
+        self.hits.clear();
+        // Those that start before `to` and end after `from`.
+        let before = self.starts.partition_point(|&s| s < to);
+        fn descend(tree: &[usize], sorted: &[u32], hits: &mut Vec<u32>, node: usize, (lo, hi): (usize, usize), before: usize, from: usize) {
+            if lo >= before || tree[node] <= from {
+                return;
+            }
+            if hi - lo == 1 {
+                hits.push(sorted[lo]);
+                return;
+            }
+            let mid = (lo + hi) / 2;
+            descend(tree, sorted, hits, 2 * node, (lo, mid), before, from);
+            descend(tree, sorted, hits, 2 * node + 1, (mid, hi), before, from);
+        }
+        if before > 0 {
+            descend(&self.tree, &self.sorted, &mut self.hits, 1, (0, self.leaves), before, from);
+        }
+        self.hits.sort_unstable();
+        let indexed = self.sorted.len();
+        let all = &self.all;
+        let those = self.hits.iter().map(|&k| all[k as usize]).chain(all[indexed..].iter().copied());
+        holding(those, from, to)
+    }
+
+    /// [`holder`] by the index.
+    fn holder(&mut self, from: usize, to: usize) -> Result<Arc<Shadow>, &'static str> {
+        let found = self.holding(from, to)?;
+        held_in(self.shadows.get(&found).cloned(), from, to)
+    }
 }
 
 /// What the steps of `runs` do, and which step each is (its list by address,
@@ -516,6 +664,32 @@ fn fill_to(runs: &[&HostList], step: (usize, usize)) -> Option<FillTo> {
         Step::Fill(_, _, _, to) => to.clone(),
         _ => None,
     }
+}
+
+/// [`fill_to`] for each of `chosen` that is a fill (`None` for the
+/// others), in their order: a list's lock taken once for the fills of it
+/// that stand together (a submission may name a list twice: one at a time).
+fn fill_targets(runs: &[&HostList], does: &[Does], steps: &[(usize, usize)], chosen: &[(usize, u32)]) -> Vec<Option<FillTo>> {
+    let mut out = Vec::with_capacity(chosen.len());
+    let mut open: Option<(usize, Option<std::sync::MutexGuard<'_, Deferred>>)> = None;
+    for &(i, _) in chosen {
+        if !matches!(does[i], Does::Fill { .. }) {
+            out.push(None);
+            continue;
+        }
+        let (list, at) = steps[i];
+        if open.as_ref().is_none_or(|o| o.0 != list) {
+            drop(open.take());
+            let found = runs.iter().find(|l| std::ptr::from_ref::<HostList>(l) as usize == list);
+            open = Some((list, found.map(|l| l.deferred())));
+        }
+        let deferred = open.as_ref().and_then(|o| o.1.as_ref());
+        out.push(deferred.and_then(|d| match d.copies.get(at)? {
+            Step::Fill(_, _, _, to) => to.clone(),
+            _ => None,
+        }));
+    }
+    out
 }
 
 /// A step done on the card.
@@ -694,15 +868,22 @@ impl Host {
             return Ok(None);
         }
         spent.next("steps on the card: what holds their bytes");
-        let mut writers = {
+        let fast = fast();
+        let (mut writers, mut index) = {
             let line = line();
-            let mut all = writers(&line.line);
-            all.extend(line.landing.iter().map(|w| Writer {
-                shadow: w.shadow.clone(),
-                ..*w
-            }));
-            all
+            if fast {
+                (Vec::new(), Some(Writers::of(&line)))
+            } else {
+                let mut all = writers(&line.line);
+                all.extend(line.landing.iter().map(|w| Writer {
+                    shadow: w.shadow.clone(),
+                    ..*w
+                }));
+                (all, None)
+            }
         };
+        // Where the fills' bytes go, found one list at a time ([`fast`]).
+        let mut targets = if fast { fill_targets(runs, &does, &steps, &chosen) } else { Vec::new() };
         let mut ops: Vec<Op> = Vec::with_capacity(chosen.len());
         // The places read (host copy, address, bytes, level): where in the
         // buffer between their bytes are.
@@ -712,7 +893,7 @@ impl Host {
         let mut held: HashMap<(usize, usize), Arc<Shadow>> = HashMap::default();
         let mut room = HashMap::default();
         let mut end = 0u64;
-        for &(i, level) in &chosen {
+        for (n, &(i, level)) in chosen.iter().enumerate() {
             let Some(((src, _), (dst, _))) = reads_writes(&does[i]) else {
                 continue;
             };
@@ -725,7 +906,10 @@ impl Host {
             let from = match held.get(&(src, len)) {
                 Some(from) => from.clone(),
                 None => {
-                    let from = holder(&writers, src, src + len)?;
+                    let from = match &mut index {
+                        Some(index) => index.holder(src, src + len)?,
+                        None => holder(&writers, src, src + len)?,
+                    };
                     held.insert((src, len), from.clone());
                     from
                 }
@@ -748,7 +932,10 @@ impl Host {
             };
             let to = match does[i] {
                 Does::Copy { .. } => {
-                    let to = holder(&writers, dst, dst + len)?;
+                    let to = match &mut index {
+                        Some(index) => index.holder(dst, dst + len)?,
+                        None => holder(&writers, dst, dst + len)?,
+                    };
                     if elsewhere(&does, Arc::as_ptr(&to) as usize, dst, dst + len) {
                         return Err("another host copy of what it writes is read");
                     }
@@ -757,16 +944,19 @@ impl Host {
                     }
                     // What the steps behind it read of it is in that host
                     // copy, or nowhere.
-                    writers.push(Writer {
-                        shadow: Some(to.clone()),
-                        from: dst,
-                        to: dst + len,
-                        copy: true,
-                    });
+                    match &mut index {
+                        Some(index) => index.push(&to, dst, dst + len),
+                        None => writers.push(Writer {
+                            shadow: Some(to.clone()),
+                            from: dst,
+                            to: dst + len,
+                            copy: true,
+                        }),
+                    }
                     held.clear();
                     To::Copy(to, dst)
                 }
-                _ => match fill_to(runs, steps[i]) {
+                _ => match if fast { targets[n].take() } else { fill_to(runs, steps[i]) } {
                     Some(FillTo::Slot(heap, index)) => To::Slot(heap, index),
                     Some(FillTo::Buffer(buffer)) => To::Buffer(buffer),
                     None => continue,
@@ -839,13 +1029,15 @@ impl Host {
         // order.)
         let parts = if ops.len() < 256 { 1 } else { 8 };
         crate::land::each_under(parts, &|part| {
-            for op in &ops {
-                if let To::Slot(heap, index) = &op.to
-                    && *index as usize / 4 % parts == part
-                {
-                    // (A heap that is gone: nothing can read the slot.)
-                    crate::descriptor::constant_slot(*heap, *index, &own.between, gpu + op.at, op.len as u32);
-                }
+            let mine = ops.iter().filter_map(|op| match &op.to {
+                To::Slot(heap, index) if *index as usize / 4 % parts == part => Some((*heap, *index, gpu + op.at, op.len as u32)),
+                _ => None,
+            });
+            // (A heap that is gone: nothing can read the slot.)
+            if fast {
+                crate::descriptor::constant_slots(mine, &own.between);
+            } else {
+                mine.for_each(|(heap, index, at, len)| crate::descriptor::constant_slot(heap, index, &own.between, at, len));
             }
         });
         let copies = ops.iter().filter(|op| matches!(op.to, To::Copy(..))).count();
@@ -888,13 +1080,29 @@ static NOTED: Mutex<Option<Noted>> = Mutex::new(None);
 fn noted(ops: &[Op]) {
     let mut noted = NOTED.lock().unwrap_or_else(|e| e.into_inner());
     let noted = noted.get_or_insert_with(Default::default);
+    // (Steps of the same kind one after the other counted together: the
+    // table is asked once for them.)
+    let mut run: Option<((usize, (u64, u64), (u64, u64)), (u64, usize, usize))> = None;
     for op in ops {
         let (to, dst) = match &op.to {
             To::Copy(to, dst) => (to.span(), *dst),
             To::Slot(..) | To::Buffer(_) => ((0, 0), 0),
         };
-        let e = noted.entry((op.len, op.from.0.span(), to)).or_default();
-        *e = (e.0 + 1, op.from.1, dst);
+        let key = (op.len, op.from.0.span(), to);
+        match &mut run {
+            Some((k, e)) if *k == key => *e = (e.0 + 1, op.from.1, dst),
+            _ => {
+                if let Some((k, (n, src, dst))) = run.take() {
+                    let e = noted.entry(k).or_default();
+                    *e = (e.0 + n, src, dst);
+                }
+                run = Some((key, (1, op.from.1, dst)));
+            }
+        }
+    }
+    if let Some((k, (n, src, dst))) = run {
+        let e = noted.entry(k).or_default();
+        *e = (e.0 + n, src, dst);
     }
 }
 
@@ -1151,6 +1359,56 @@ mod tests {
     fn what_no_host_copy_holds_is_refused() {
         let writers = [Writer { shadow: None, from: 100, to: 108, copy: false }];
         assert!(holder(&writers, 104, 120).is_err());
+    }
+
+    /// [`fast`]: the index of what flights write finds what the walk over
+    /// all of it found, the same host copy or the same refusal, also with
+    /// copies done here added behind it.
+    #[test]
+    fn the_index_finds_what_the_walk_finds() {
+        let mut seed = 777u32;
+        let mut random = move |n: u32| {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            (seed >> 16) % n
+        };
+        let (mut found, mut refused, mut none) = (0, 0, 0);
+        for round in 0..3000 {
+            let writer = |random: &mut dyn FnMut(u32) -> u32| {
+                let s = [0, 0x10, 0x10, 0x20, 0x20, 0x20, 0x30][random(7) as usize];
+                let from = random(300) as usize;
+                let to = match random(20) {
+                    0 => from + 100_000,
+                    1 => from.saturating_sub(3),
+                    _ => from + random(40) as usize,
+                };
+                (s, from, to)
+            };
+            // Few writers, or many of one host copy.
+            let n = if round % 4 == 0 { 300 } else { random(30) };
+            let mut all: Vec<(usize, usize, usize)> = (0..n).map(|_| writer(&mut random)).collect();
+            if round % 4 == 0 {
+                all.iter_mut().for_each(|w| w.0 = if w.0 == 0 && random(50) != 0 { 0x10 } else { w.0 });
+            }
+            let mut index = Writers { all: all.clone(), ..Writers::default() };
+            index.index();
+            for _ in 0..random(3) {
+                let w = writer(&mut random);
+                all.push(w);
+                index.all.push(w);
+            }
+            for _ in 0..30 {
+                let from = random(340) as usize;
+                let to = from + random(50) as usize;
+                let walked = holding(all.iter().copied(), from, to);
+                assert_eq!(index.holding(from, to), walked, "[{from}, {to}) in {all:?}");
+                match walked {
+                    Ok(0) => none += 1,
+                    Ok(_) => found += 1,
+                    Err(_) => refused += 1,
+                }
+            }
+        }
+        assert!(found > 1000 && refused > 1000 && none > 1000, "{found} {refused} {none}");
     }
 
     /// Reads are all before writes, between two buffers and within one, and

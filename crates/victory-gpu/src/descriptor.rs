@@ -891,6 +891,37 @@ pub(crate) fn constant_slot(
     }
 }
 
+/// [`constant_slot`] for each of `slots` (heap, index, `gpu`, size), in
+/// their order, all of `buffer`: the heaps looked up under one hold of
+/// their lock, not one per slot (thousands a frame, on several threads).
+#[cfg(windows)]
+pub(crate) fn constant_slots(
+    slots: impl Iterator<Item = (usize, u32, u64, u32)>,
+    buffer: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+) {
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    let mut last: Option<(usize, Option<&host::HostHeap>)> = None;
+    for (heap, index, gpu, size) in slots {
+        let host = match last {
+            Some((at, host)) if at == heap => host,
+            _ => {
+                let host = if heaps.iter().any(|&(_, _, h)| h == heap) {
+                    // SAFETY: registered heaps are live (removed when
+                    // dropped, which waits for the lock we hold).
+                    unsafe { &*(heap as *const Heap) }.host.get().and_then(Option::as_ref)
+                } else {
+                    None
+                };
+                last = Some((heap, host));
+                host
+            }
+        };
+        if let Some(host) = host {
+            host.constant_at(index, buffer, gpu, size);
+        }
+    }
+}
+
 #[cfg(windows)]
 impl Drop for Heap {
     fn drop(&mut self) {
