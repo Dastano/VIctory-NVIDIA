@@ -10032,6 +10032,22 @@ impl Meter {
                      hold still (the runtime remapping it); the rest is reading, hashing and detiling"
                 );
             }
+            {
+                let [detiling, whole, part, left, copied, hashing] =
+                    [0, 1, 2, 3, 4, 5].map(|i| crate::texture::DETILING[i].swap(0, Ordering::Relaxed) as f64);
+                if detiling + hashing > 0.0 {
+                    tracing::info!(
+                        "of the texture refreshes per frame, all threads: {:.1} ms detiling, {:.1} ms hashing; {:.1} detilings                          of every row, {:.1} of the changed rows only (VICTORY_TEXREF_PARTIAL: now {}), which left {:.0} rows as                          they were and copied {:.0}",
+                        detiling / 1e6 / frames,
+                        hashing / 1e6 / frames,
+                        whole / frames,
+                        part / frames,
+                        if crate::texture::partial() { "on" } else { "off" },
+                        left / frames,
+                        copied / frames,
+                    );
+                }
+            }
             let [through, left, filled, short] =
                 [0, 1, 2, 3].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if through + left + filled > 0.0 {

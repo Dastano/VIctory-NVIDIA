@@ -110,6 +110,106 @@ struct Last {
     /// first checks, and after the hash found a change the guard had not
     /// seen ([`hot_textures`]). 0: not checked under the guard yet.
     hot_until: u64,
+    /// [`partial`]: the digests of the [`CHUNK`]s of the memory the staging
+    /// buffer was last detiled from (empty: not known), the write-watch
+    /// asking it was last detiled after from memory read after it, nothing
+    /// else having asked since (0: none), and the levels that were the
+    /// title's at that detiling if it was done to the end (`None`: not).
+    chunks: Vec<Digest>,
+    watched: u64,
+    held: Option<u32>,
+}
+
+/// Whether a refresh that finds a texture's memory changed detiles only the
+/// rows whose tiled bytes changed, leaving the others in the staging buffer
+/// as the last detiling wrote them (`VICTORY_TEXREF_PARTIAL=0`: all of it at
+/// every change, as before). Which bytes changed: of write-watched memory
+/// the pages written since the asking the buffer was last detiled after (an
+/// unwritten texture was passed over on that same word before); of hashed
+/// memory the [`CHUNK`]s whose digest is not the one of the bytes last
+/// detiled (the texture's digest is the digest of its chunks' digests,
+/// [`texture_digest`]). A row is copied if any byte of the span its
+/// elements lie in changed (`victory_formats::texture::Layout::detile_where`),
+/// so every row copied or left holds what a whole detiling writes. Anything
+/// else (the first detiling, an exact refresh, levels on demand that are
+/// held otherwise, a detiling that failed halfway, memory read another way
+/// since) detiles all of it. A detiling in part that copies no row leaves
+/// the buffer as it was, and it is not uploaded again for it. (Texture
+/// refreshes took 5 ms a frame on all threads walking in run r70, 33 MB
+/// read; detiling is the dearest step a megabyte: 0.08-0.11 ms on one
+/// thread against 0.04 for the digest and 0.03 for a copy.)
+pub(crate) fn partial() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXREF_PARTIAL").is_none_or(|v| v != "0"))
+}
+
+/// The bytes a texture's memory is hashed by for [`partial`]: a 64 KiB
+/// block of the console's tiling.
+const CHUNK: usize = 64 << 10;
+
+/// Since the last frame-rate line, of texture refreshes on every thread:
+/// nanoseconds detiling, detilings of all rows, detilings of the changed
+/// rows only ([`partial`]), rows left as they were by these and rows copied
+/// by them, nanoseconds hashing.
+pub(crate) static DETILING: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
+/// The digest a texture's staging buffer is known by (`last.hash`, the host
+/// copy's `holds`): with [`partial`] the [`digest`] of the digests of its
+/// [`CHUNK`]s, which are left in `chunks`; else the digest of the bytes.
+fn texture_digest(bytes: &[u8], chunks: &mut Vec<Digest>) -> Digest {
+    let started = std::time::Instant::now();
+    chunks.clear();
+    let whole = if partial() {
+        chunks.extend(bytes.chunks(CHUNK).map(digest));
+        let mut all = Vec::with_capacity(16 * chunks.len() + 8);
+        for chunk in chunks.iter() {
+            all.extend_from_slice(&chunk.0.to_le_bytes());
+        }
+        all.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+        digest(&all)
+    } else {
+        digest(bytes)
+    };
+    DETILING[5].fetch_add(started.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+    whole
+}
+
+/// The byte ranges, from the texture's start, of the chunks whose digests
+/// differ (in order, neighbours joined); `None` if the two are not of the
+/// same memory.
+fn changed_chunks(was: &[Digest], now: &[Digest], size: usize) -> Option<Vec<(u64, u64)>> {
+    if was.len() != now.len() || was.is_empty() {
+        return None;
+    }
+    let mut changed: Vec<(u64, u64)> = Vec::new();
+    for (i, _) in was.iter().zip(now).enumerate().filter(|(_, (a, b))| a != b) {
+        let (from, to) = ((i * CHUNK) as u64, ((i + 1) * CHUNK).min(size) as u64);
+        match changed.last_mut() {
+            Some(last) if last.1 == from => last.1 = to,
+            _ => changed.push((from, to)),
+        }
+    }
+    Some(changed)
+}
+
+/// The byte ranges, from `start`, of the pages in `written` (in page
+/// order, as [`crate::watch::writes`] gives them) last written after the
+/// asking `asked`, cut to `size` bytes; neighbours joined.
+fn written_since(written: &[(usize, u64)], asked: u64, start: usize, size: usize) -> Vec<(u64, u64)> {
+    let page = crate::watch::PAGE;
+    let mut changed: Vec<(u64, u64)> = Vec::new();
+    for &(p, _) in written.iter().filter(|&&(_, w)| w > asked) {
+        let from = (p * page).saturating_sub(start).min(size) as u64;
+        let to = ((p + 1) * page).saturating_sub(start).min(size) as u64;
+        if from >= to {
+            continue;
+        }
+        match changed.last_mut() {
+            Some(last) if last.1 >= from => last.1 = last.1.max(to),
+            _ => changed.push((from, to)),
+        }
+    }
+    changed
 }
 
 /// Frames a guarded texture is hashed at every check from its first check,
@@ -1323,6 +1423,14 @@ pub(crate) fn card_writes(list: &HostList, resource: This, texture: &ID3D12Resou
     });
 }
 
+/// The digest of `tiled` and of its chunks ([`texture_digest`]), if it is
+/// not the digest of what the staging buffer was last filled from.
+fn changed_digest(last: &Last, tiled: &[u8]) -> Option<(Digest, Vec<Digest>)> {
+    let mut chunks = Vec::new();
+    let hash = texture_digest(tiled, &mut chunks);
+    (last.hash != Some(hash)).then_some((hash, chunks))
+}
+
 impl Staging {
     /// The bytes of title memory a refresh reads (`VICTORY_PASSES_LONG_FIRST`
     /// orders a pass's textures by it, `crate::host`).
@@ -1459,13 +1567,20 @@ impl Staging {
             if !exact && last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                 return 0;
             }
+            // (`partial`: the buffer holds what the last detiling here wrote
+            // of the memory read after the asking `last.asked`, and nothing
+            // has asked since: only the pages written after it changed.)
+            let changed = (partial() && !exact && last.asked != 0 && last.watched == last.asked)
+                .then(|| written_since(&written, last.asked, start, size));
             last.asked = now;
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
             with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
-                self.detile(read);
+                self.detile(read, last, changed.as_deref());
             });
+            last.watched = now;
+            last.chunks.clear();
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
             return size;
@@ -1490,6 +1605,7 @@ impl Staging {
             const HASH_EVERY: u64 = 8;
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
+            last.watched = 0;
             let frame = crate::frame::current();
             let turn = frame
                 .wrapping_add((start >> 16) as u64)
@@ -1560,15 +1676,16 @@ impl Staging {
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
             let changed = with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
-                let hash = digest(read);
-                if last.hash == Some(hash) {
+                let Some((hash, chunks)) = changed_digest(last, read) else {
                     return false;
-                }
-                last.hash = Some(hash);
+                };
                 if read.iter().all(|&b| b == 0) {
+                    // (Not detiled: the buffer holds what it held, and the
+                    // chunks it was detiled from stay as they were.)
+                    last.hash = Some(hash);
                     return false;
                 }
-                self.detile(read);
+                self.detile_hashed(last, read, hash, chunks);
                 true
             });
             #[cfg(feature = "diagnostics")]
@@ -1586,15 +1703,14 @@ impl Staging {
         // view becomes one of those before the read in place below is done.)
         if through_copy() || !crate::watch::soft_runs(start, size).is_empty() {
             return with_title(self.memory, size, |tiled| {
-                let hash = digest(tiled);
+                let hashed = changed_digest(last, tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
-                if last.hash == Some(hash) {
+                let Some((hash, chunks)) = hashed else {
                     return size;
-                }
-                last.hash = Some(hash);
+                };
                 found_blind(last);
-                self.detile(tiled);
+                self.detile_hashed(last, tiled, hash, chunks);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
                 size
@@ -1603,15 +1719,14 @@ impl Staging {
         // SAFETY: committed memory of the texture's layout size, and it
         // stays committed while `_mapped` is held.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
-        let hash = digest(tiled);
+        let hashed = changed_digest(last, tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
-        if last.hash == Some(hash) {
+        let Some((hash, chunks)) = hashed else {
             return size;
-        }
-        last.hash = Some(hash);
+        };
         found_blind(last);
-        self.detile(tiled);
+        self.detile_hashed(last, tiled, hash, chunks);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
         size
@@ -1630,10 +1745,8 @@ impl Staging {
             if !crate::host::read_into(self.memory, read) {
                 return false;
             }
-            let hash = digest(read);
-            if last.hash != Some(hash) {
-                last.hash = Some(hash);
-                self.detile(read);
+            if let Some((hash, chunks)) = changed_digest(last, read) {
+                self.detile_hashed(last, read, hash, chunks);
             }
             true
         });
@@ -1645,6 +1758,7 @@ impl Staging {
         } else {
             UNLOCKED[1].fetch_add(1, Relaxed);
             last.asked = 0;
+            last.watched = 0;
             0
         }
     }
@@ -1663,10 +1777,8 @@ impl Staging {
             if !crate::host::read_into(self.memory, read) {
                 return false;
             }
-            let hash = digest(read);
-            if last.hash != Some(hash) {
-                last.hash = Some(hash);
-                self.detile(read);
+            if let Some((hash, chunks)) = changed_digest(last, read) {
+                self.detile_hashed(last, read, hash, chunks);
                 changed = true;
             }
             true
@@ -1698,8 +1810,11 @@ impl Staging {
                 crate::watch::change_over();
             }
             if got != 0 {
-                last.hash = Some(digest(read));
-                self.detile(read);
+                let mut chunks = Vec::new();
+                let hash = texture_digest(read, &mut chunks);
+                // (All of it: what the buffer held is not what is there.)
+                last.chunks.clear();
+                self.detile_hashed(last, read, hash, chunks);
             }
             got
         });
@@ -1708,6 +1823,7 @@ impl Staging {
         if got < there.max(self.expected.load(Relaxed)) {
             UNLOCKED[3].fetch_add(1, Relaxed);
             last.asked = 0;
+            last.watched = 0;
             crate::descriptor::host::read_short(start);
         } else {
             crate::descriptor::host::read_all(start);
@@ -1715,9 +1831,26 @@ impl Staging {
         size
     }
 
-    /// Detiles `tiled` (the texture's memory) into the staging buffer.
-    fn detile(&self, tiled: &[u8]) {
-        self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+    /// [`Staging::detile`] of `tiled`, whose digest `hash` and chunks'
+    /// digests `chunks` ([`texture_digest`]) are not those it was last
+    /// detiled from: with [`partial`] only the rows of the chunks that
+    /// changed.
+    fn detile_hashed(&self, last: &mut Last, tiled: &[u8], hash: Digest, chunks: Vec<Digest>) {
+        let changed = changed_chunks(&last.chunks, &chunks, tiled.len());
+        last.hash = Some(hash);
+        last.chunks = chunks;
+        // (Not read after an asking: the next watched refresh detiles all.)
+        last.watched = 0;
+        self.detile(tiled, last, changed.as_deref());
+    }
+
+    /// Detiles `tiled` (the texture's memory) into the staging buffer: with
+    /// `changed` (byte ranges from the texture's start, in order) only the
+    /// rows whose tiled bytes touch one of them, if the buffer holds the
+    /// last detiling done to the end with the same levels held ([`partial`]).
+    fn detile(&self, tiled: &[u8], last: &mut Last, changed: Option<&[(u64, u64)]>) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let started = std::time::Instant::now();
         // Levels on demand: which levels are the title's is judged here,
         // once, for what the staging buffer holds from now on. The step
         // that gives levels their memory goes by this answer.
@@ -1732,6 +1865,13 @@ impl Staging {
         } else {
             u32::MAX
         };
+        let changed = changed.filter(|_| partial() && last.held == Some(held));
+        last.held = None;
+        // (Detiling only the changed rows, the buffer is changed only if
+        // one is copied: below.)
+        if changed.is_none() {
+            self.dirty.store(true, Relaxed);
+        }
         #[cfg(feature = "diagnostics")]
         if tiled.iter().all(|&b| b == 0) {
             tracing::debug!(
@@ -1740,33 +1880,76 @@ impl Staging {
                 "a sampled texture's memory is all zero (not streamed yet, or a failed BCPack read)"
             );
         }
-        for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
-            let (mip, slice) = self.part(i);
-            let f = footprint.Footprint;
-            let pitch = f.RowPitch as usize;
-            // The last row of the last subresource is not padded to its pitch
-            // (VIctory 4fc9d70): to the end of the buffer at most, where a
-            // block of the pool goes on with another texture's.
-            let len = (pitch * rows as usize * f.Depth as usize)
-                .min(self.bytes.saturating_sub(footprint.Offset) as usize);
-            // SAFETY: the subresource's part of the mapped staging buffer.
-            let linear = unsafe {
-                std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
-            };
-            if mip < 32 && held & (1 << mip) == 0 {
-                // Not the title's: zeros, not what lies in that memory.
-                linear.fill(0);
-                continue;
-            }
-            if let Err(e) =
-                self.layout
-                    .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
-            {
+        // SAFETY: the mapped staging buffer, written by this refresh alone
+        // (`last` is held).
+        let data = unsafe { std::slice::from_raw_parts_mut(self.data, self.bytes as usize) };
+        let counted = match detile_parts(&self.layout, &self.footprints, &self.rows, |i| self.part(i), data, tiled, held, changed) {
+            Ok(counted) => counted,
+            Err((e, mip, slice)) => {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
+                self.dirty.store(true, Relaxed);
                 return;
             }
+        };
+        last.held = Some(held);
+        if counted[1] != 0 {
+            self.dirty.store(true, Relaxed);
         }
+        DETILING[0].fetch_add(started.elapsed().as_nanos() as u64, Relaxed);
+        DETILING[if changed.is_some() { 2 } else { 1 }].fetch_add(1, Relaxed);
+        DETILING[3].fetch_add(counted[0], Relaxed);
+        DETILING[4].fetch_add(counted[1], Relaxed);
     }
+}
+
+/// [`Staging::detile`]'s copying: `tiled` into `data`, the staging buffer
+/// laid out by `footprints` and `rows` (part `i` is the title's level and
+/// array slice `part(i)`); levels not `held` are zeros. With `changed`
+/// (byte ranges from the texture's start, in order) only the rows whose
+/// tiled bytes touch one of them are copied ([`partial`]), the others left
+/// as they are. Returns the rows so left and copied (0 and 0 without
+/// `changed`), or what failed and where.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn detile_parts(
+    layout: &victory_formats::texture::Layout,
+    footprints: &[D3D12_PLACED_SUBRESOURCE_FOOTPRINT],
+    rows: &[u32],
+    part: impl Fn(usize) -> (u32, u32),
+    data: &mut [u8],
+    tiled: &[u8],
+    held: u32,
+    changed: Option<&[(u64, u64)]>,
+) -> Result<[u64; 2], (victory_formats::texture::Error, u32, u32)> {
+    let counted = [std::cell::Cell::new(0u64), std::cell::Cell::new(0u64)];
+    let wanted = |lo: u64, hi: u64| {
+        let Some(changed) = changed else { return true };
+        // The first range that ends past `lo`: the one that may begin
+        // before `hi`.
+        let i = changed.partition_point(|&(_, to)| to <= lo);
+        let copy = changed.get(i).is_some_and(|&(from, _)| from < hi);
+        counted[usize::from(copy)].set(counted[usize::from(copy)].get() + 1);
+        copy
+    };
+    for (i, (footprint, &rows)) in footprints.iter().zip(rows).enumerate() {
+        let (mip, slice) = part(i);
+        let f = footprint.Footprint;
+        let pitch = f.RowPitch as usize;
+        // The last row of the last subresource is not padded to its pitch
+        // (VIctory 4fc9d70): to the end of the buffer at most, where a
+        // block of the pool goes on with another texture's.
+        let at = (footprint.Offset as usize).min(data.len());
+        let len = (pitch * rows as usize * f.Depth as usize).min(data.len() - at);
+        let linear = &mut data[at..at + len];
+        if mip < 32 && held & (1 << mip) == 0 {
+            // Not the title's: zeros, not what lies in that memory.
+            linear.fill(0);
+            continue;
+        }
+        layout
+            .detile_where(tiled, mip, slice, linear, pitch, pitch * rows as usize, &wanted)
+            .map_err(|e| (e, mip, slice))?;
+    }
+    Ok([counted[0].get(), counted[1].get()])
 }
 
 /// Lets go of a title texture's staging buffer (lists that recorded an
@@ -1869,7 +2052,7 @@ pub(crate) fn unchanged(resource: This, first: u32) -> bool {
         if crate::host::read_there(memory, read) == 0 {
             return false;
         }
-        digest(read) == held
+        texture_digest(read, &mut Vec::new()) == held
     })
 }
 
@@ -2709,5 +2892,137 @@ mod allocation_costs {
             timed("texture placed in 64 MB heaps", N, 1, &place);
             timed("texture placed in 64 MB heaps", N, 8, &place);
         }
+    }
+}
+
+
+/// [`partial`]: detiling only the rows of the bytes that changed leaves the
+/// staging buffer as detiling all of it does, byte for byte.
+#[cfg(test)]
+mod partial_tests {
+    use super::*;
+
+    /// A console layout of a 2D texture: width, height, levels, DXGI
+    /// format; and the staging buffer's footprints for it as the host
+    /// lays them out (rows 256 bytes apart at least, parts 512).
+    fn texture(width: u32, height: u32, mips: u32, format: u32) -> (victory_formats::texture::Layout, Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>, Vec<u32>, usize) {
+        let words = [3u32, 0, 0, 0, width, 0, height, mips << 16 | 1, format, 1, 0, 0x105, 0, 0];
+        // SAFETY: 56 bytes in the description's layout.
+        let desc = unsafe { words.as_ptr().cast::<crate::resource::ResourceDesc>().read_unaligned() };
+        let layout = crate::resource::texture_layout(&desc).expect("a console layout").planes[0].layout.clone();
+        let mut at = 0u64;
+        let mut footprints = Vec::new();
+        let mut rows = Vec::new();
+        for m in &layout.mips {
+            let pitch = (m.width * layout.desc.element_bytes).next_multiple_of(256);
+            footprints.push(D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                Offset: at,
+                Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                    Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(format as i32),
+                    Width: m.width,
+                    Height: m.height,
+                    Depth: 1,
+                    RowPitch: pitch,
+                },
+            });
+            rows.push(m.height);
+            at = (at + u64::from(pitch) * u64::from(m.height)).next_multiple_of(512);
+        }
+        (layout, footprints, rows, at as usize)
+    }
+
+    #[test]
+    fn detiling_the_changed_rows_writes_what_detiling_all_does() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        // BC7 with 11 levels, RGBA8 and R8 with a few.
+        for (width, height, mips, format) in [(1024, 1024, 11, 98), (512, 256, 4, 28), (1000, 600, 3, 61)] {
+            let (layout, footprints, rows, bytes) = texture(width, height, mips, format);
+            let size = layout.size as usize;
+            assert!(size > 2 * CHUNK, "{format}: chunks to tell apart");
+            let part = |i: usize| (i as u32, 0);
+            for held in [u32::MAX, !1] {
+                let mut title: Vec<u8> = (0..size).map(|_| next() as u8).collect();
+                // What the buffer holds: the whole detiling of `title`.
+                let mut staged = vec![0xa5u8; bytes];
+                assert_eq!(detile_parts(&layout, &footprints, &rows, part, &mut staged, &title, held, None), Ok([0, 0]));
+                let mut chunks = Vec::new();
+                let mut hash = texture_digest(&title, &mut chunks);
+                // A texture placed 0x3000 bytes into a page of the watch.
+                let start = 0x10_0000_3000usize;
+                // Rows the detilings in part left: they do leave some.
+                let mut kept = 0;
+                for round in 0..30 {
+                    let mut now = title.clone();
+                    let mut touched = Vec::new();
+                    for _ in 0..1 + round % 3 {
+                        let len = [1usize, 64, 4096, CHUNK, size / 3][(next() % 5) as usize].min(size);
+                        let at = (next() as usize) % (size - len + 1);
+                        now[at..at + len].iter_mut().for_each(|b| *b = b.wrapping_add(1 + (next() % 255) as u8));
+                        touched.push((at, at + len));
+                    }
+                    // The old way: every row.
+                    let mut all = staged.clone();
+                    assert_eq!(detile_parts(&layout, &footprints, &rows, part, &mut all, &now, held, None), Ok([0, 0]));
+                    // Hashed memory: the chunks whose digests changed.
+                    let mut now_chunks = Vec::new();
+                    let now_hash = texture_digest(&now, &mut now_chunks);
+                    assert_ne!(now_hash, hash, "round {round}: a change changes the digest");
+                    let changed = changed_chunks(&chunks, &now_chunks, size).expect("of the same memory");
+                    let mut hashed = staged.clone();
+                    let [left, copied] = detile_parts(&layout, &footprints, &rows, part, &mut hashed, &now, held, Some(&changed)).unwrap();
+                    assert!(hashed == all, "{format} held {held:#x} round {round}: hashed in part");
+                    assert!(left + copied > 0);
+                    kept += left;
+                    // Watched memory: the pages written since the asking
+                    // the buffer was detiled after (2 against 1), among
+                    // pages written before it.
+                    let page = crate::watch::PAGE;
+                    let mut written: Vec<(usize, u64)> = (start / page..(start + size).div_ceil(page)).filter(|p| p % 3 == 0).map(|p| (p, 1)).collect();
+                    for &(from, to) in &touched {
+                        for p in (start + from) / page..(start + to).div_ceil(page) {
+                            match written.iter_mut().find(|w| w.0 == p) {
+                                Some(w) => w.1 = 2,
+                                None => written.push((p, 2)),
+                            }
+                        }
+                    }
+                    written.sort_unstable();
+                    let changed = written_since(&written, 1, start, size);
+                    let mut watched = staged.clone();
+                    detile_parts(&layout, &footprints, &rows, part, &mut watched, &now, held, Some(&changed)).unwrap();
+                    assert!(watched == all, "{format} held {held:#x} round {round}: watched in part");
+                    // Nothing changed: nothing copied, the digest the same.
+                    let mut same = all.clone();
+                    assert_eq!(detile_parts(&layout, &footprints, &rows, part, &mut same, &now, held, Some(&[])).map(|c| c[1]), Ok(0));
+                    assert!(same == all);
+                    assert_eq!(texture_digest(&now.clone(), &mut Vec::new()), now_hash);
+                    (title, staged, chunks, hash) = (now, all, now_chunks, now_hash);
+                }
+                assert!(kept > 0, "{format}: rows left as they were");
+                drop(title);
+            }
+        }
+    }
+
+    /// The pages of the watch, from a texture's start that is not a
+    /// page's: cut to the texture, those of the asking or earlier left
+    /// out, neighbours joined.
+    #[test]
+    fn written_pages_as_bytes_of_the_texture() {
+        let page = crate::watch::PAGE;
+        let start = 5 * page + 0x3000;
+        let size = 3 * page;
+        let written = [(4, 9), (5, 9), (6, 1), (7, 9), (8, 9), (9, 9)];
+        assert_eq!(
+            written_since(&written, 1, start, size),
+            [(0, (page - 0x3000) as u64), ((2 * page - 0x3000) as u64, size as u64)]
+        );
+        assert_eq!(written_since(&written, 9, start, size), []);
     }
 }

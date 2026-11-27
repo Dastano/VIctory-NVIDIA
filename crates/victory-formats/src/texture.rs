@@ -639,7 +639,27 @@ impl Layout {
         row_pitch: usize,
         depth_pitch: usize,
     ) -> Result<(), Error> {
-        self.walk::<true>(tiled, linear, mip, slice, row_pitch, depth_pitch)
+        self.walk::<true>(tiled, linear, mip, slice, row_pitch, depth_pitch, None)
+    }
+
+    /// [`Layout::detile`] of only the rows `wanted` says yes to: it is
+    /// given the span of tiled bytes a row's elements lie in, `[lo, hi)`
+    /// from the texture's start (of a 3D mip: each depth slice's rows). The
+    /// rows it says no to are left in `linear` as they are, so that a row
+    /// whose tiled bytes are the ones it was last detiled from need not be
+    /// copied again: what is left there is what detiling it would write.
+    #[allow(clippy::too_many_arguments)]
+    pub fn detile_where(
+        &self,
+        tiled: &[u8],
+        mip: u32,
+        slice: u32,
+        linear: &mut [u8],
+        row_pitch: usize,
+        depth_pitch: usize,
+        wanted: &dyn Fn(u64, u64) -> bool,
+    ) -> Result<(), Error> {
+        self.walk::<true>(tiled, linear, mip, slice, row_pitch, depth_pitch, Some(wanted))
     }
 
     /// The reverse of [`Layout::detile`]: linear rows into tiled memory.
@@ -652,7 +672,7 @@ impl Layout {
         row_pitch: usize,
         depth_pitch: usize,
     ) -> Result<(), Error> {
-        self.walk::<false>(linear, tiled, mip, slice, row_pitch, depth_pitch)
+        self.walk::<false>(linear, tiled, mip, slice, row_pitch, depth_pitch, None)
     }
 
     /// Copies contiguous runs in one direction between the two layouts.
@@ -665,6 +685,7 @@ impl Layout {
         slice: u32,
         row_pitch: usize,
         depth_pitch: usize,
+        wanted: Option<&dyn Fn(u64, u64) -> bool>,
     ) -> Result<(), Error> {
         let m = self.mips.get(mip as usize).ok_or(Error::Invalid)?;
         let depth = m.depth;
@@ -732,16 +753,33 @@ impl Layout {
             body.iter()
                 .all(|&(offset, _, len)| len == size && offset.is_multiple_of(size))
         });
+        // Where a row's elements lie, from the row's tiled start: the
+        // span `wanted` is asked about.
+        let (lo, hi) = if linear {
+            (0, bytes)
+        } else {
+            let lo = runs.iter().map(|r| r.0).min().unwrap_or(0);
+            (lo, runs.iter().map(|r| r.0 + r.2).max().unwrap_or(lo))
+        };
         for z in 0..depth {
             let (s, inner) = self.split(first + z);
             let base = u64::from(s) * self.slice_size + m.offset;
             for y in 0..m.height {
                 let linear_row = z as usize * depth_pitch + y as usize * row_pitch;
+                let tiled_row = if linear {
+                    base + u64::from(y) * u64::from(m.pitch) * n as u64
+                } else {
+                    base + self.row(m, y, inner)
+                };
+                if let Some(wanted) = wanted
+                    && !wanted(tiled_row + lo as u64, tiled_row + hi as u64)
+                {
+                    continue;
+                }
                 if linear {
-                    let tiled_row = base + u64::from(y) * u64::from(m.pitch) * n as u64;
                     copy_run::<DETILE>(src, dst, tiled_row as usize, linear_row, bytes);
                 } else {
-                    let tiled_row = (base + self.row(m, y, inner)) as usize;
+                    let tiled_row = tiled_row as usize;
                     match chunk_size {
                         Some(8) if tiled_row.is_multiple_of(8) => {
                             copy_runs::<8, DETILE>(src, dst, body, tiled_row, linear_row)
@@ -1509,5 +1547,92 @@ mod tests {
             Err(Error::TooSmall)
         );
         assert_eq!(l.offset(0, 64, 0, 0), Err(Error::Invalid));
+    }
+
+    /// [`Layout::detile_where`] over what was detiled before, asked to
+    /// copy only the rows whose tiled bytes touch the changed ones, writes
+    /// what a whole [`Layout::detile`] of the new bytes writes: every byte
+    /// a row reads lies in the span it is asked about. (For the host's
+    /// texture refreshes that detile only what changed.)
+    #[test]
+    fn detiling_where_bytes_changed_is_detiling_all() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let cases = [
+            (Dimension::Tex2d, 300, 200, 1, 6, 4, Swizzle::LINEAR),
+            (Dimension::Tex2d, 512, 512, 1, 10, 16, Swizzle::SW_64KB_S),
+            (Dimension::Tex2d, 1024, 256, 1, 11, 8, Swizzle::SW_64KB_D),
+            (Dimension::Tex2d, 640, 360, 3, 4, 4, Swizzle::SW_64KB_D),
+            (Dimension::Tex2d, 300, 100, 2, 5, 2, Swizzle::SW_4KB_D),
+            (Dimension::Tex2d, 256, 256, 2, 9, 1, Swizzle::SW_4KB_S),
+            (Dimension::Tex2d, 128, 64, 1, 8, 2, Swizzle::SW_256B_D),
+            (Dimension::Tex3d, 64, 64, 16, 4, 4, Swizzle::SW_64KB_S),
+            (Dimension::Tex3d, 40, 24, 12, 3, 8, Swizzle::SW_4KB_S),
+        ];
+        for (dimension, width, height, depth, mips, element_bytes, swizzle) in cases {
+            let d = Desc {
+                dimension,
+                width,
+                height,
+                depth,
+                mips,
+                element_bytes,
+                block: 1,
+                samples: 1,
+                swizzle,
+            };
+            let l = Layout::new(&d).unwrap_or_else(|e| panic!("{d:?}: {e:?}"));
+            assert!(l.addressable(), "{swizzle:?}");
+            let size = l.size as usize;
+            let old: Vec<u8> = (0..size).map(|_| next() as u8).collect();
+            let slices = if dimension == Dimension::Tex3d { 1 } else { depth };
+            let parts: Vec<(u32, u32, usize, usize, usize)> = (0..slices)
+                .flat_map(|slice| (0..l.mips.len() as u32).map(move |mip| (mip, slice)))
+                .map(|(mip, slice)| {
+                    let m = &l.mips[mip as usize];
+                    let pitch = m.width as usize * element_bytes as usize;
+                    let depth_pitch = pitch * m.height as usize;
+                    (mip, slice, pitch, depth_pitch, depth_pitch * m.depth as usize)
+                })
+                .collect();
+            let whole = |tiled: &[u8]| -> Vec<Vec<u8>> {
+                parts
+                    .iter()
+                    .map(|&(mip, slice, pitch, depth_pitch, len)| {
+                        let mut out = vec![0u8; len];
+                        l.detile(tiled, mip, slice, &mut out, pitch, depth_pitch).unwrap();
+                        out
+                    })
+                    .collect()
+            };
+            let before = whole(&old);
+            for round in 0..24 {
+                // A few changed runs: a byte, a page, a 64 KiB block's worth.
+                let mut new = old.clone();
+                let mut changed = Vec::new();
+                for _ in 0..1 + round % 3 {
+                    let len = [1usize, 4096, 65536][(next() % 3) as usize].min(size);
+                    let at = (next() as usize) % (size - len + 1);
+                    new[at..at + len].iter_mut().for_each(|b| *b = !*b);
+                    changed.push((at as u64, (at + len) as u64));
+                }
+                let wanted = |lo: u64, hi: u64| changed.iter().any(|&(a, b)| a < hi && lo < b);
+                let after = whole(&new);
+                for (i, &(mip, slice, pitch, depth_pitch, _)) in parts.iter().enumerate() {
+                    let mut out = before[i].clone();
+                    l.detile_where(&new, mip, slice, &mut out, pitch, depth_pitch, &wanted).unwrap();
+                    assert!(out == after[i], "{swizzle:?} {width}x{height}x{depth} mip {mip} slice {slice} round {round}");
+                    // Nothing wanted: nothing written.
+                    let mut out = before[i].clone();
+                    l.detile_where(&new, mip, slice, &mut out, pitch, depth_pitch, &|_, _| false).unwrap();
+                    assert!(out == before[i]);
+                }
+            }
+        }
     }
 }
