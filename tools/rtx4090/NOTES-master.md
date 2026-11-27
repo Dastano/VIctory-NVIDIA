@@ -253,3 +253,8 @@ script spanned two displays: 15 rendered / 30 shown again. r94 (1600x900 window 
 Frame generation shows at most the monitor's refresh: on 59 Hz it holds the rendered rate at ~30. Without it
 the build renders 38-47 fps. On this monitor: no frame generation for the most responsive game, frame generation
 for 60 shown at 30 rendered. Keep the game window fully on the 4090's monitor (F1 FULLSCREEN there).
+
+r95 (`VICTORY_GUARD_SHARDS=1`: the guards' lock split into 64 region locks, refresh holes noted under claims;
+perf/guard-shards, merged, off by default): 38.4 fps, 13 of 89 lines under 29.5, over 50 ms 277, longest 315 ms:
+no change from r88/r89; no deadlock or fault. The lock waits were not what set the slow seconds. Its diagnostics
+split of lock waits by holder stays in for the next diagnostics run.
