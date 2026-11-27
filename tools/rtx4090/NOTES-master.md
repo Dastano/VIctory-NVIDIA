@@ -65,3 +65,23 @@ Picture (r39 screenshots): the diner cutscene shows every face whole; the jail c
 
 Missing faces / stutter while turning in the first foxhound runs came from an empty host pipeline library and
 pipelines made live; `-Shaders -Warm` with the run's switches (now in the launcher) fixed both.
+
+## Walking, not only standing (r46-r48, with the frame-time line)
+
+The 30.0 above is with the player at the cell window: the camera turns there are small (the scene
+holds the view until she walks). r46 (12 min, 21 turns at the window, frame-time line per second): 9 minutes in
+the cell, ~16,000 frames, every fps line 30.0, 4 frames over 40 ms, the longest 60 ms.
+
+r47 walks (S/D/W/A, big right-stick turns, look up/down), which also plays on: out of the cell after the guard,
+the corridors and the crowded common room (7,000-10,000 draws a frame), into the next cutscene and mission:
+
+| Run | Switches | world fps mean / lowest line | frames over 40 ms (of ~16,900) | longest |
+|---|---|---|---|---|
+| r47 | master | 28.8 / 8.7 | 1,301 | 572 ms |
+| r48 | master + `VICTORY_SUBMIT_FRAMES=2` | 28.6 / 0.2 | 1,063 | 4,862 ms |
+
+No picture faults in the r47 shots (faces, heads, light fine). The drops follow the draw count: the submitting
+thread does 27 ms a frame at the window and 30-39 ms in the common room (lists' steps 13-16 ms, of which
+refreshes 7-10 ms where over 90 % of ~7,000-11,000 refreshes copy nothing; planning card steps 3-6 ms; waits for
+the submission lock and flights up to 5 ms). Holding 30 fps while walking through the crowd needs that work
+cut (the refresh design), not a switch.
