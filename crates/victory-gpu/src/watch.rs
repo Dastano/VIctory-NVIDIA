@@ -439,6 +439,161 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
 const AHEAD_GAP: usize = (8 << 20) / PAGE;
 /// The most one asking covers (its answer needs 8 bytes per 4 KiB page).
 const AHEAD_MAX: usize = (1 << 30) / PAGE;
+/// [`AHEAD_GAP`] with [`fast`]: 256 KiB.
+const FAST_GAP: usize = (256 << 10) / PAGE;
+
+/// Whether a submission's askings walk less and wait less
+/// (`VICTORY_WATCH_FAST=0`: as before; on by default, as every range a
+/// submission refreshes is still asked at the same moment as before, by the
+/// same kind of kernel call, only fewer pages beside them).
+///
+/// An asking costs what it walks, not what it finds: 0.6-0.9 microseconds a
+/// MiB of title memory, written or not, and some 0.3 for the call (timed on
+/// the RTX 4090 PC, the kernel calls alone, the game running beside them:
+/// 1 GiB 0.75-1.4 ms in one call, 0.9 in 1,024 of a MiB; two pieces of 1 MiB
+/// 8 MiB apart 15 us asked together, 4 apart, with six threads writing). The submitting thread's
+/// askings are 3.1-4.0 ms a frame (some 8 GB walked, 99.5 % of it unwritten).
+/// With the switch:
+///
+/// - Ranges are asked together across gaps of [`FAST_GAP`] at most, not
+///   [`AHEAD_GAP`]: what lies between them was walked for nothing (two
+///   pieces of 1 MiB with 1 MiB between: 5.9 us together, 3.7 apart; with
+///   pages of both written 10.1 and 8.5). A refresh of memory in such a gap,
+///   which this submission's lists do not refresh, asks for itself as any
+///   range not asked ahead does.
+/// - The askings of different reservations run on threads of their own
+///   ([`ASKERS`]), this one among them: 64 reservations of 8 MiB 1.0 ms on
+///   one thread, 0.35 on four, 1.6-2.6
+///   times faster with pages written (one reservation's askings wait for
+///   each other in the kernel, and stay on one thread). The submission's
+///   range stays held ([`Asking::hold_all`]) the while, and what they found
+///   is noted under one number after all of them, as before.
+fn fast() -> bool {
+    crate::toggled!("VICTORY_WATCH_FAST")
+}
+
+/// The gap across which a submission's ranges are asked together.
+fn ahead_gap() -> usize {
+    if fast() { FAST_GAP } else { AHEAD_GAP }
+}
+
+/// Askings of fewer pages than this in all stay on the asking thread with
+/// [`fast`]: waking the others would cost more than they save.
+const WIDE_PAGES: usize = (32 << 20) / PAGE;
+
+/// The reservation `page` lies in (its base page), or the page itself if
+/// Windows does not say.
+fn reservation(page: usize) -> usize {
+    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+    // SAFETY: plain data, filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a query about an address; the answer goes into `info`.
+    let n = unsafe { VirtualQuery((page * PAGE) as *const _, &mut info, size_of_val(&info)) };
+    if n == 0 || info.AllocationBase.is_null() { page } else { info.AllocationBase as usize / PAGE }
+}
+
+/// `ask` of each of `items` (`pages`: the page range of one), answered in
+/// their order: with [`fast`], more than one reservation among them and
+/// enough to walk, those of a reservation one after the other on one of
+/// [`ASKERS`] (or this thread), the reservations side by side.
+fn ask_wide<T: Send + Sync + 'static, R: Send + 'static>(
+    items: Vec<T>,
+    pages: impl Fn(&T) -> (usize, usize),
+    ask: impl Fn(&T) -> R + Send + Sync + 'static,
+) -> Vec<R> {
+    let walked: usize = items.iter().map(|t| pages(t)).map(|(a, b)| b.saturating_sub(a)).sum();
+    if !fast() || items.len() < 2 || walked < WIDE_PAGES {
+        return items.iter().map(ask).collect();
+    }
+    let mut by: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for (i, item) in items.iter().enumerate() {
+        by.entry(reservation(pages(item).0)).or_default().push(i);
+    }
+    if by.len() < 2 {
+        return items.iter().map(ask).collect();
+    }
+    let groups: Vec<Vec<usize>> = by.into_values().collect();
+    let answers: Vec<Mutex<Option<R>>> = (0..items.len()).map(|_| Mutex::new(None)).collect();
+    let shared = std::sync::Arc::new((items, answers, ask));
+    let jobs = groups
+        .into_iter()
+        .map(|group| {
+            let shared = shared.clone();
+            Box::new(move || {
+                let (items, answers, ask) = &*shared;
+                for i in group {
+                    *answers[i].lock().unwrap_or_else(|e| e.into_inner()) = Some(ask(&items[i]));
+                }
+            }) as AskJob
+        })
+        .collect();
+    askers_run(jobs);
+    shared.1.iter().map(|a| a.lock().unwrap_or_else(|e| e.into_inner()).take().expect("asked above")).collect()
+}
+
+/// A piece of [`ask_wide`]'s work: kernel askings, nothing else.
+type AskJob = Box<dyn FnOnce() + Send>;
+
+/// The threads [`ask_wide`] gives work to, and its queue: theirs alone. (Not
+/// those of [`crate::shadow::wide_each`]: the asking thread holds every range
+/// ([`Asking::hold_all`]) and takes from the queue too, and a job of another
+/// caller's that asks the journal would wait for it there for ever.)
+static ASKERS: (Mutex<std::collections::VecDeque<AskJob>>, Condvar) =
+    (Mutex::new(std::collections::VecDeque::new()), Condvar::new());
+/// How many: with the asking thread, four reservations asked at a time.
+const ASKERS_N: usize = 3;
+
+/// Runs `jobs` on [`ASKERS`] and this thread; returns when all are done.
+fn askers_run(jobs: Vec<AskJob>) {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        for i in 0..ASKERS_N {
+            let _ = std::thread::Builder::new().name(format!("victory-ask-{i}")).spawn(|| {
+                crate::cores::keep_helper_on_fast_cores("victory-ask");
+                loop {
+                    let job = {
+                        let mut queue = ASKERS.0.lock().unwrap_or_else(|e| e.into_inner());
+                        loop {
+                            if let Some(job) = queue.pop_front() {
+                                break job;
+                            }
+                            queue = ASKERS.1.wait(queue).unwrap_or_else(|e| e.into_inner());
+                        }
+                    };
+                    job();
+                }
+            });
+        }
+    });
+    let left = std::sync::Arc::new((Mutex::new(jobs.len()), Condvar::new()));
+    let wake = jobs.len() - 1;
+    {
+        let mut queue = ASKERS.0.lock().unwrap_or_else(|e| e.into_inner());
+        for job in jobs {
+            let left = left.clone();
+            queue.push_back(Box::new(move || {
+                job();
+                let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
+                *n -= 1;
+                if *n == 0 {
+                    left.1.notify_all();
+                }
+            }));
+        }
+    }
+    (0..wake.min(ASKERS_N)).for_each(|_| ASKERS.1.notify_one());
+    loop {
+        let job = ASKERS.0.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
+        match job {
+            Some(job) => job(),
+            None => break,
+        }
+    }
+    let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
+    while *n > 0 {
+        n = left.1.wait(n).unwrap_or_else(|e| e.into_inner());
+    }
+}
 
 /// Asks the kernel about many ranges `(start, end)` at once, before the
 /// [`writes`] of each: ranges close together are one asking, and `writes`
@@ -470,20 +625,36 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     }
     let _all = Asking::hold_all();
     let (mut asked, mut written) = (Vec::new(), Vec::new());
+    let gap = ahead_gap();
+    // The runs asked together: where each begins and ends in `pieces`, and
+    // its pages. (A piece alone is left to `writes`, [`ask_run`].)
+    let mut runs = Vec::new();
     let mut i = 0;
     while i < pieces.len() {
         let first = pieces[i].0;
         let mut last = pieces[i].1;
         let mut k = i + 1;
         while k < pieces.len()
-            && pieces[k].0 <= last + AHEAD_GAP
+            && pieces[k].0 <= last + gap
             && last.max(pieces[k].1) - first <= AHEAD_MAX
         {
             last = last.max(pieces[k].1);
             k += 1;
         }
-        ask_run(&pieces[i..k], &mut asked, &mut written);
+        if k - i >= 2 {
+            runs.push((i, k, first, last));
+        }
         i = k;
+    }
+    let pieces = std::sync::Arc::new(pieces);
+    let answers = ask_wide(runs, |r| (r.2, r.3), move |&(i, k, ..)| {
+        let (mut asked, mut written) = (Vec::new(), Vec::new());
+        ask_run(&pieces[i..k], &mut asked, &mut written);
+        (asked, written)
+    });
+    for (a, w) in answers {
+        asked.extend(a);
+        written.extend(w);
     }
     note_hot(&written);
     let mut j = journal_mut();
@@ -710,22 +881,44 @@ fn ask_rest(ranges: &[(usize, usize)]) {
     // askings a frame with the switch on, as without it). They are asked
     // here, once; what is not write-watched stays with `writes`.
     let mut written = Vec::new();
-    for &(start, end) in ranges {
-        if start >= end || published(start, end) || refused_as_view(start, end) {
-            continue;
-        }
-        let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-        let held = if skip {
-            ahead.holds(first, last) || added.holds(first, last)
-        } else {
-            ahead.ranges.iter().any(|&(a, b)| a <= first && last <= b)
-        };
-        if !held && let Some(pages) = kernel_written(first, last) {
-            written.extend(pages);
-            if skip {
+    if fast() {
+        let (to_ask, skipped) = rest_to_ask(ranges, &ahead);
+        // Asked side by side ([`ask_wide`]); one held by another of them is
+        // asked after, if that other was not write-watched.
+        let answers = ask_wide(to_ask.clone(), |&r| r, |&(first, last)| kernel_written(first, last));
+        for (&(first, last), pages) in to_ask.iter().zip(answers) {
+            if let Some(pages) = pages {
+                written.extend(pages);
                 added.add(first, last);
+            }
+        }
+        for (first, last) in skipped {
+            if !added.holds(first, last) && let Some(pages) = kernel_written(first, last) {
+                written.extend(pages);
+                added.add(first, last);
+            }
+        }
+        if !skip {
+            ahead.ranges.extend(std::mem::take(&mut added.by_first));
+        }
+    } else {
+        for &(start, end) in ranges {
+            if start >= end || published(start, end) || refused_as_view(start, end) {
+                continue;
+            }
+            let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+            let held = if skip {
+                ahead.holds(first, last) || added.holds(first, last)
             } else {
-                ahead.ranges.push((first, last));
+                ahead.ranges.iter().any(|&(a, b)| a <= first && last <= b)
+            };
+            if !held && let Some(pages) = kernel_written(first, last) {
+                written.extend(pages);
+                if skip {
+                    added.add(first, last);
+                } else {
+                    ahead.ranges.push((first, last));
+                }
             }
         }
     }
@@ -744,6 +937,30 @@ fn ask_rest(ranges: &[(usize, usize)]) {
     ahead.extend(added.by_first);
     j.kept = !ahead.is_empty();
     j.ahead.set(ahead);
+}
+
+/// With [`fast`], of the ranges `(start, end)` [`ask_rest`] is given: the
+/// page ranges to ask, each not held by `ahead` nor by one before it, and
+/// those held by one before it (asked if that one was not write-watched).
+fn rest_to_ask(ranges: &[(usize, usize)], ahead: &Ahead) -> (Vec<(usize, usize)>, Vec<(usize, usize)>) {
+    let mut asking = Added::default();
+    let (mut to_ask, mut skipped) = (Vec::new(), Vec::new());
+    for &(start, end) in ranges {
+        if start >= end || published(start, end) || refused_as_view(start, end) {
+            continue;
+        }
+        let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+        if ahead.holds(first, last) {
+            continue;
+        }
+        if asking.holds(first, last) {
+            skipped.push((first, last));
+            continue;
+        }
+        asking.add(first, last);
+        to_ask.push((first, last));
+    }
+    (to_ask, skipped)
 }
 
 /// The submission's one asking stands no longer: its refreshes are done,
@@ -4398,6 +4615,52 @@ mod tests {
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }
 
+    /// With `VICTORY_WATCH_FAST`: of a submission's ranges in three
+    /// reservations, asked side by side and across small gaps only, every
+    /// page written before the asking is in the journal under a number of
+    /// it; a range held by another is not asked twice.
+    #[test]
+    fn fast_askings_see_every_write_before_them() {
+        const MB: usize = 1 << 20;
+        // SAFETY: fresh write-watched allocations, freed at the end.
+        let bases: Vec<usize> = (0..3)
+            .map(|_| unsafe { VirtualAlloc(std::ptr::null(), 16 * MB, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as usize)
+            .collect();
+        assert!(bases.iter().all(|&b| b != 0));
+        let [a, b, c] = [bases[0], bases[1], bases[2]];
+        let ranges = [
+            // One run (64 KiB apart).
+            (a, a + 8 * MB),
+            (a + 8 * MB + PAGE, a + 16 * MB),
+            // Two alone (1 MiB apart): asked by `ask_rest`.
+            (b, b + MB),
+            (b + 2 * MB, b + 16 * MB),
+            // Alone, and one it holds.
+            (c, c + 16 * MB),
+            (c + MB, c + 2 * MB),
+        ];
+        let (to_ask, skipped) = rest_to_ask(&ranges, &Ahead::new());
+        assert_eq!(to_ask.len(), 5);
+        assert_eq!(skipped, [((c + MB) / PAGE, (c + 2 * MB) / PAGE)]);
+        let pages = [a + 3 * MB, a + 15 * MB, b + 8, b + 9 * MB, c + MB + 5, c + 15 * MB];
+        for &at in &pages {
+            // SAFETY: committed pages of ours.
+            unsafe { (at as *mut u8).write_volatile(1) };
+        }
+        let before = ASKED.load(std::sync::atomic::Ordering::Relaxed);
+        ask_once(&ranges);
+        let found: Vec<Option<u64>> = {
+            let j = journal();
+            pages.iter().map(|at| j.written.get(&(at / PAGE)).copied()).collect()
+        };
+        ask_once_end();
+        assert!(found.iter().all(|w| w.is_some_and(|w| w > before)), "{found:?} after {before}");
+        for base in bases {
+            // SAFETY: our allocations.
+            unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+        }
+    }
+
     /// The runtime maps a view and then tells us; a copy's refresh on another
     /// thread can guard it in between. Told, it is the title's to write: a
     /// block left read-only and forgotten would be an access violation in
@@ -6043,3 +6306,4 @@ mod many_askers_tests {
         assert!(!BITS.swap_on(70) && BITS.swap_on(70) && BITS.all(70, 71));
     }
 }
+
