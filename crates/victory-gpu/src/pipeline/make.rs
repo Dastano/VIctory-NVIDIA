@@ -95,7 +95,9 @@ fn water_light_left_out(shaders: &[Arc<Shader>]) -> bool {
     *LEAVE_OUT.get_or_init(|| match std::env::var("VICTORY_WATER_LIGHT").as_deref() {
         Ok("1") => false,
         Ok("0") => true,
-        _ => !victory_shader::emit::wave64_fix(),
+        // Left out unless asked for: with VICTORY_WAVE64_FIX on, the RTX 4090 PC's run r66 (the first boat
+        // ride) still showed small black blocks scattered over the open water around the boat.
+        _ => true,
     }) && victory_shader::emit::host_settings()[0] == 32
         && shaders.iter().any(|s| WATER_LIGHT.contains(&s.hash.as_str()))
 }
