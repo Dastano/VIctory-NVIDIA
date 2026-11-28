@@ -97,6 +97,8 @@ mod shadow;
 #[cfg(windows)]
 mod freeze;
 #[cfg(windows)]
+mod ring;
+#[cfg(windows)]
 mod tiles;
 pub mod signature;
 #[cfg(windows)]

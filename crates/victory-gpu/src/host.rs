@@ -3216,6 +3216,8 @@ struct Flight {
     /// The list of ours that ran ahead of them ([`card_steps`]).
     own: Option<card_steps::Taken>,
     texture_back_ranges: Vec<(usize, usize)>,
+    /// What it writes exactly ([`exact_writes`]; empty without [`crate::ring`]).
+    exact: Vec<(usize, usize)>,
 }
 
 /// One thing in the line of what waits for the card, in order.
@@ -3232,6 +3234,11 @@ struct Line {
     /// The title memory the flights' shaders and texture readbacks may write
     /// (address, end), in order and joined.
     written: Vec<(usize, usize)>,
+    /// With [`crate::ring`]: what of title memory the flights write by
+    /// writers whose bytes are known exactly (copies at their place, copies
+    /// done on the card, read-backs, bottom-of-pipe writes), in order and
+    /// joined. Not shaders.
+    exact: Vec<(usize, usize)>,
     /// Host lists in the flights.
     lists: usize,
     /// The value signalled on the host's fence behind the last flight.
@@ -3260,6 +3267,7 @@ unsafe impl Send for Line {}
 static LINE: Mutex<Line> = Mutex::new(Line {
     line: Vec::new(),
     written: Vec::new(),
+    exact: Vec::new(),
     lists: 0,
     target: 0,
     settling: false,
@@ -3337,14 +3345,14 @@ fn flying() -> bool {
 /// runs steps of ours that may read or write it anywhere; what the
 /// flights' shaders write is not there yet.
 fn late_blocked(runs: &[&HostList]) -> Option<usize> {
-    let (written, copies) = {
+    let (written, exact, copies) = {
         let line = line();
         if line.written.is_empty() {
             return None;
         }
-        (line.written.clone(), card_steps::copies(&line))
+        (line.written.clone(), line.exact.clone(), card_steps::copies(&line))
     };
-    blocked_by(&written, runs, true).or_else(|| card_steps::copied_read(&copies, runs).then_some(WHY_READ))
+    blocked_by(&written, &exact, runs, true).or_else(|| card_steps::copied_read(&copies, runs).then_some(WHY_READ))
 }
 
 /// Whether a small fill of upload memory, or copy of a title buffer, goes on without waiting for
@@ -3506,6 +3514,102 @@ fn read_blocked(written: &[(usize, usize)], src: usize, len: usize) -> bool {
     touches(written, src, src + len) && !fill_is_titles(src, len)
 }
 
+/// Whether flights stop a fill of `len` bytes at `src`: [`read_blocked`];
+/// a fill from the title's ring of constants once it is in use
+/// ([`crate::ring::free`]) only by what `exact` holds, the exactly known
+/// writers in the air (the ring's compares say shaders never write it).
+/// `exact` = `written` gives what [`read_blocked`] gives.
+fn fill_blocked(written: &[(usize, usize)], exact: &[(usize, usize)], src: usize, len: usize) -> bool {
+    fill_blocked_in(written, exact, src, len, ring_used(src, len))
+}
+
+/// [`fill_blocked`], `in_ring` whether the fill lies in the ring in use.
+fn fill_blocked_in(written: &[(usize, usize)], exact: &[(usize, usize)], src: usize, len: usize, in_ring: bool) -> bool {
+    read_blocked(written, src, len) && !(in_ring && !touches(exact, src, src + len))
+}
+
+thread_local! {
+    /// `VICTORY_RING_CPU=check`: [`fill_blocked`] answers as the ring in use
+    /// would ([`ring_check`]).
+    static RING_AS_IF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn ring_used(src: usize, len: usize) -> bool {
+    crate::ring::free(src, len) || (RING_AS_IF.with(std::cell::Cell::get) && crate::ring::contains(src, len))
+}
+
+/// `VICTORY_RING_CPU=check`, flights in the air, the ring confirmed: what
+/// the ring in use would do for `runs`, beside the old path that decides.
+/// Counts the fills it would serve free, those an exact writer keeps, and
+/// whether the submission would not wait or plan where the old path does;
+/// gives the fills it would serve free with a hash of the bytes they would
+/// read now ([`crate::ring::check_note`]).
+fn ring_check(runs: &[&HostList]) -> Vec<(usize, usize, u64)> {
+    if crate::ring::mode() != crate::ring::Mode::Check || crate::ring::extent().is_none() {
+        return Vec::new();
+    }
+    let (written, exact) = {
+        let line = line();
+        if line.written.is_empty() {
+            return Vec::new();
+        }
+        (line.written.clone(), line.exact.clone())
+    };
+    let mut out = Vec::new();
+    let mut kept = 0u64;
+    let mut scratch = Vec::new();
+    for list in runs {
+        for step in &list.deferred().copies {
+            let &Step::Fill(_, src, len, _) = step else {
+                continue;
+            };
+            if !crate::ring::contains(src, len) || !read_blocked(written.as_slice(), src, len) {
+                continue;
+            }
+            if touches(&exact, src, src + len) {
+                kept += 1;
+            } else if let Some(h) = crate::ring::hash(src, len, &mut scratch) {
+                out.push((src, len, h));
+            }
+        }
+    }
+    crate::ring::count(crate::ring::S_WOULD, out.len() as u64);
+    crate::ring::count(crate::ring::S_EXACT, kept);
+    if !out.is_empty() && blocked_by(&written, &written, runs, false).is_some() {
+        RING_AS_IF.with(|f| f.set(true));
+        let new = blocked_by(&written, &exact, runs, false);
+        RING_AS_IF.with(|f| f.set(false));
+        if new.is_none() {
+            crate::ring::count(crate::ring::S_UNBLOCKED, 1);
+        }
+    }
+    out
+}
+
+/// With the ring of constants in use ([`crate::ring::holds`]): whether a
+/// step of `runs` may read the ring through a host copy on the card: a
+/// refresh (a view, a copy at its place, a step done on the card), a frozen
+/// copy, a copy at its place or a declared shader write that touches it.
+/// Without one the sends of this submission hold the ring back.
+fn ring_read_on_card(runs: &[&HostList]) -> bool {
+    let Some((lo, hi)) = crate::ring::extent() else {
+        return true;
+    };
+    let (lo, hi) = (lo as usize, hi as usize);
+    let meets = |a: usize, b: usize| a < hi && lo < b;
+    runs.iter().any(|list| {
+        list.deferred().copies.iter().any(|step| match step {
+            Step::Refresh(_, at, len) | Step::GpuWrite(_, at, len) => meets(*at, *at + *len),
+            Step::Frozen(shadow) => {
+                let (start, len) = shadow.span();
+                meets(start as usize, (start + len) as usize)
+            }
+            Step::Placed(p) => meets(p.src, p.src + p.len) || meets(p.dst, p.dst + p.len),
+            _ => false,
+        })
+    })
+}
+
 /// Whether they stop a title buffer copy, and if so whether by its source.
 fn copy_blocked(written: &[(usize, usize)], dst: usize, src: usize, len: usize) -> Option<bool> {
     let read = read_blocked(written, src, len);
@@ -3513,9 +3617,10 @@ fn copy_blocked(written: &[(usize, usize)], dst: usize, src: usize, len: usize) 
 }
 
 /// [`late_blocked`] against `written`, the title memory flights' shaders
-/// may write (in order, joined); `count` whether the kind of read is
-/// counted for the frame line.
-fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Option<usize> {
+/// may write (in order, joined), and `exact`, what of it is written by
+/// writers known exactly ([`fill_blocked`]); `count` whether the kind of
+/// read is counted for the frame line.
+fn blocked_by(written: &[(usize, usize)], exact: &[(usize, usize)], runs: &[&HostList], count: bool) -> Option<usize> {
     if written.is_empty() {
         return None;
     }
@@ -3539,7 +3644,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     }
                 }
                 &Step::Fill(_, src, len, _) => {
-                    if read_blocked(written, src, len) {
+                    if fill_blocked(written, exact, src, len) {
                         if count {
                             LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
                             #[cfg(feature = "diagnostics")]
@@ -3688,7 +3793,8 @@ pub(crate) fn joinable<'a>(ahead: impl Iterator<Item = &'a HostList>, next: &[&H
     }
     let mut joined = Vec::new();
     join_ranges(&mut joined, written);
-    blocked_by(&joined, next, false).is_none()
+    // (All of it as exact: the ring changes nothing here.)
+    blocked_by(&joined, &joined, next, false).is_none()
 }
 
 /// Whether a bottom-of-pipe write of `list` meets `wait`.
@@ -4268,6 +4374,7 @@ fn late_line(frames: f64) {
         );
     }
     card_steps::log(frames);
+    crate::ring::log(frames);
     crate::port::log(frames);
     crate::watch::port_guard_line(frames);
     crate::port_cbv::log(frames);
@@ -4307,6 +4414,162 @@ pub(crate) mod upcheck;
 mod stamps;
 #[cfg(feature = "diagnostics")]
 pub(crate) use stamps::{timeline_ready, timeline_restart, timeline_stamps};
+
+#[cfg(test)]
+mod ring_tests {
+    use super::{fill_blocked_in, join_ranges, touches};
+
+    /// A model of title memory, flights and fills, run on the old path and
+    /// on the ring's beside each other with the same events: every fill
+    /// reads the same bytes, and title memory ends the same.
+    ///
+    /// The heap is declared written whole by every flight (the skinning
+    /// passes' view), shaders write only outside the ring (what the ring's
+    /// compares confirm), and some flights copy into the ring exactly (a
+    /// copy at its place, bytes known), into a part of it the title's CPU
+    /// leaves to such copies (it does not write what the card still writes).
+    /// The title's CPU writes the ring's next slots before each submission. A fill that the plan holds up
+    /// waits for the flights in the air (their writes land in order); one
+    /// that it lets go reads title memory as it is.
+    #[test]
+    fn fills_from_the_ring_read_what_waiting_reads() {
+        const HEAP: usize = 0x10000;
+        const RING: (usize, usize) = (0x4000, 0xc000);
+        // Where copies at their place write into the ring.
+        const COPIED: usize = 0x5000;
+        struct Flight {
+            /// (address, bytes) its shaders and copies write when it lands.
+            writes: Vec<(usize, Vec<u8>)>,
+            exact: Vec<(usize, usize)>,
+        }
+        struct World {
+            title: Vec<u8>,
+            air: Vec<Flight>,
+            read: Vec<Vec<u8>>,
+        }
+        impl World {
+            fn land_all(&mut self) {
+                for flight in self.air.drain(..) {
+                    for (at, bytes) in flight.writes {
+                        self.title[at..at + bytes.len()].copy_from_slice(&bytes);
+                    }
+                }
+            }
+            fn land_one(&mut self) {
+                if !self.air.is_empty() {
+                    let flight = self.air.remove(0);
+                    for (at, bytes) in flight.writes {
+                        self.title[at..at + bytes.len()].copy_from_slice(&bytes);
+                    }
+                }
+            }
+            fn fill(&mut self, src: usize, len: usize, ring: bool) {
+                let written: Vec<(usize, usize)> = if self.air.is_empty() { Vec::new() } else { vec![(0, HEAP)] };
+                let mut exact = Vec::new();
+                join_ranges(&mut exact, self.air.iter().flat_map(|f| f.exact.iter().copied()));
+                let in_ring = ring && RING.0 <= src && src + len <= RING.1;
+                if fill_blocked_in(&written, &exact, src, len, in_ring) {
+                    self.land_all();
+                }
+                self.read.push(self.title[src..src + len].to_vec());
+            }
+        }
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut random = |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        let start: Vec<u8> = (0..HEAP).map(|i| (i * 7 + 3) as u8).collect();
+        let mut old = World { title: start.clone(), air: Vec::new(), read: Vec::new() };
+        let mut new = World { title: start, air: Vec::new(), read: Vec::new() };
+        let mut slot = COPIED;
+        let (mut free, mut kept) = (0, 0);
+        for round in 0..2000u32 {
+            // The title writes the ring's next slots (wrapping), as its CPU
+            // does before the draws that read them.
+            let mut fills = Vec::new();
+            for _ in 0..1 + random(4) {
+                let len = 64 + 16 * random(20);
+                if slot + len > RING.1 {
+                    slot = COPIED;
+                }
+                let value = (round as u8).wrapping_mul(31).wrapping_add(slot as u8);
+                for w in [&mut old, &mut new] {
+                    w.title[slot..slot + len].fill(value);
+                }
+                fills.push((slot, len));
+                slot = (slot + len).next_multiple_of(256);
+            }
+            // Fills of older slots and outside the ring too.
+            if random(3) == 0 {
+                fills.push((RING.0 + random(RING.1 - RING.0 - 512), 256));
+            }
+            if random(2) == 0 {
+                fills.push((RING.0 + random(COPIED - RING.0 - 128), 128));
+            }
+            if random(4) == 0 {
+                fills.push((random(RING.0 - 256), 128));
+            }
+            for &(src, len) in &fills {
+                let before = touches(&[RING], src, src + len) && !new.air.is_empty();
+                new.fill(src, len, true);
+                old.fill(src, len, false);
+                if before {
+                    if new.air.is_empty() { kept += 1 } else { free += 1 }
+                }
+            }
+            // The submission goes up: shaders write outside the ring, and
+            // now and then a copy at its place writes into it, exactly.
+            let mut writes = Vec::new();
+            let mut exact = Vec::new();
+            for _ in 0..random(3) {
+                let at = if random(2) == 0 { random(RING.0 - 64) } else { RING.1 + random(HEAP - RING.1 - 64) };
+                writes.push((at, vec![random(256) as u8; 64]));
+            }
+            if random(5) == 0 {
+                let at = RING.0 + random(COPIED - RING.0 - 128);
+                writes.push((at, vec![random(256) as u8; 128]));
+                exact.push((at, at + 128));
+            }
+            for w in [&mut old, &mut new] {
+                w.air.push(Flight { writes: writes.clone(), exact: exact.clone() });
+            }
+            // Flights land in order now and then.
+            let lands = random(3);
+            for w in [&mut old, &mut new] {
+                for _ in 0..lands {
+                    w.land_one();
+                }
+            }
+        }
+        old.land_all();
+        new.land_all();
+        assert_eq!(old.read, new.read);
+        assert!(old.title == new.title);
+        // Both kinds came up: fills served free, and fills an exact writer
+        // held up.
+        assert!(free > 100, "{free}");
+        assert!(kept > 10, "{kept}");
+    }
+
+    /// The decision alone: a fill in the ring under the heap's declared
+    /// writes is free, one outside it or under an exact writer is not.
+    #[test]
+    fn a_fill_from_the_ring_is_free() {
+        let written = [(0x1000, 0x9000)];
+        let exact = [(0x5000, 0x5100)];
+        assert!(!fill_blocked_in(&written, &exact, 0x4000, 0x100, true));
+        assert!(fill_blocked_in(&written, &exact, 0x4000, 0x100, false));
+        assert!(fill_blocked_in(&written, &exact, 0x50f0, 0x40, true));
+        assert!(!fill_blocked_in(&written, &exact, 0xa000, 0x40, false));
+        // With every write taken as exact: the old answer.
+        for (src, len) in [(0x4000, 0x100), (0x50f0, 0x40), (0xa000, 0x40)] {
+            assert_eq!(fill_blocked_in(&written, &written, src, len, true), fill_blocked_in(&written, &written, src, len, false));
+        }
+    }
+}
 
 #[cfg(test)]
 mod late_tests {
@@ -4409,6 +4672,33 @@ fn declare_once() -> bool {
 
 /// The ranges the shaders of `runs` may write, per host copy, as declared.
 /// One list's lock at a time: a submission may name a list twice.
+/// With [`crate::ring`]: what a submission sent ahead writes in title
+/// memory by writers whose bytes are known exactly, unjoined: the
+/// destinations of its copies at their place in the lists and of the copies
+/// done on the card for it, its buffer and texture read-backs, its
+/// bottom-of-pipe writes. Empty with the ring off.
+fn exact_writes<'a>(runs: impl Iterator<Item = &'a HostList>, sent: &Sent) -> Vec<(usize, usize)> {
+    if crate::ring::mode() == crate::ring::Mode::Off {
+        return Vec::new();
+    }
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    for list in runs {
+        let deferred = list.deferred();
+        for step in &deferred.copies {
+            if let Step::Placed(p) = step {
+                out.push((p.dst, p.dst + p.len));
+            }
+        }
+        out.extend(deferred.backs.iter().map(|&(_, at, [row, rows, pitch])| (at, at + rows.saturating_sub(1) * pitch + row)));
+    }
+    if let Some(own) = &sent.own {
+        out.extend(own.copied_ranges());
+    }
+    out.extend(sent.texture_back_ranges.iter().copied());
+    out.extend(sent.writes.iter().map(|&(at, _, bytes)| (at, at + bytes)));
+    out
+}
+
 fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
     // The lists' summaries, made when they were closed: the same ranges in
     // the same order ([`split_submit`]).
@@ -4912,7 +5202,10 @@ impl Host {
     /// `relay`).
     /// `picked`: ranges that may be written too, and ranges to look at
     /// (`crate::picked`).
-    fn card_before(&self, declared: &[Declared], picked: &crate::picked::Ranges, flown: bool) -> Option<CardPlan> {
+    ///
+    /// `ring_hold`: the sends leave the ring of constants out
+    /// ([`crate::shadow::card_dirty`]).
+    fn card_before(&self, declared: &[Declared], picked: &crate::picked::Ranges, flown: bool, ring_hold: bool) -> Option<CardPlan> {
         use std::sync::Arc;
         if !crate::shadow::cards() {
             return None;
@@ -4935,7 +5228,7 @@ impl Host {
         };
         let gathering = crate::timeline::span("copies in the card's memory: what changed");
         let changed = std::time::Instant::now();
-        let mut dirty = crate::shadow::card_dirty(sent_as);
+        let mut dirty = crate::shadow::card_dirty(sent_as, ring_hold);
         card_part(2, changed);
         gathering.end();
         if declared.is_empty() && dirty.is_empty() && looked.is_empty() {
@@ -5647,6 +5940,7 @@ impl Host {
             let Line {
                 line: items,
                 written,
+                exact,
                 lists,
                 settling,
                 poke,
@@ -5660,16 +5954,27 @@ impl Host {
             landing.clear();
             // What is still in the air, from the flights that are.
             written.clear();
+            exact.clear();
             *lists = 0;
             let mut ranges = Vec::new();
+            let mut exactly = Vec::new();
             for item in items.iter() {
-                if let Late::Run(flight) = item {
-                    *lists += flight.order.len().max(1);
-                    ranges.extend(flight.back.iter().flat_map(|(_, r)| r.iter().copied()));
-                    ranges.extend(flight.texture_back_ranges.iter().copied());
+                match item {
+                    Late::Run(flight) => {
+                        *lists += flight.order.len().max(1);
+                        ranges.extend(flight.back.iter().flat_map(|(_, r)| r.iter().copied()));
+                        ranges.extend(flight.texture_back_ranges.iter().copied());
+                        exactly.extend(flight.exact.iter().copied());
+                    }
+                    Late::Write(at, _, bytes) => exactly.push((*at, *at + *bytes)),
+                    Late::Signal(..) => {}
                 }
             }
             join_ranges(written, ranges);
+            if crate::ring::mode() != crate::ring::Mode::Off {
+                join_ranges(exact, exactly);
+                crate::ring::air_exact(exact);
+            }
             *settling = false;
             // The landed lists are reset, and what queues hold looked at,
             // by the helper thread (they take locks a waiter may hold).
@@ -5880,9 +6185,10 @@ impl Host {
         let after = std::time::Instant::now();
         let told = !sent.writes.is_empty();
         let sizes = crate::memory::asked_sizes(order.iter().map(|&i| lists[i].host()));
+        let exact = exact_writes(order.iter().map(|&i| lists[i].host()), &sent);
         let most = {
             let mut line = line();
-            let Line { line: items, written, lists: flying, target, .. } = &mut *line;
+            let Line { line: items, written, exact: exact_air, lists: flying, target, .. } = &mut *line;
             join_ranges(
                 written,
                 sent.back
@@ -5890,6 +6196,10 @@ impl Host {
                     .flat_map(|(_, ranges)| ranges.iter().copied())
                     .chain(sent.texture_back_ranges.iter().copied()),
             );
+            if crate::ring::mode() != crate::ring::Mode::Off {
+                join_ranges(exact_air, exact.iter().copied());
+                crate::ring::air_exact(exact_air);
+            }
             *flying += order.len();
             *target = *submitted;
             items.push(Late::Run(Flight {
@@ -5901,6 +6211,7 @@ impl Host {
                 back: sent.back,
                 own: sent.own,
                 texture_back_ranges: sent.texture_back_ranges,
+                exact,
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
             *flying >= late_most()
@@ -5942,9 +6253,10 @@ impl Host {
             return 0;
         };
         let number = sent.number;
+        let exact = exact_writes(std::iter::once(list), &sent);
         {
             let mut line = line();
-            let Line { line: items, written, lists: flying, target, .. } = &mut *line;
+            let Line { line: items, written, exact: exact_air, lists: flying, target, .. } = &mut *line;
             join_ranges(
                 written,
                 sent.back
@@ -5952,6 +6264,10 @@ impl Host {
                     .flat_map(|(_, ranges)| ranges.iter().copied())
                     .chain(sent.texture_back_ranges.iter().copied()),
             );
+            if crate::ring::mode() != crate::ring::Mode::Off {
+                join_ranges(exact_air, exact.iter().copied());
+                crate::ring::air_exact(exact_air);
+            }
             *flying += 1;
             *target = *submitted;
             items.push(Late::Run(Flight {
@@ -5963,6 +6279,7 @@ impl Host {
                 back: sent.back,
                 own: sent.own,
                 texture_back_ranges: sent.texture_back_ranges,
+                exact,
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
         }
@@ -6007,10 +6324,13 @@ impl Host {
                 let mut line = line();
                 if line.line.is_empty() {
                     line.settling = false;
+                    // (Kept while the settled flights were merged.)
+                    crate::ring::air_exact(&[]);
                     break;
                 }
                 line.settling = true;
                 line.written.clear();
+                line.exact.clear();
                 line.lists = 0;
                 std::mem::take(&mut line.line)
             };
@@ -6209,6 +6529,11 @@ impl Host {
         // settles them first, one sent ahead only if preparing it reads
         // what they write.
         // Or the reads are done on the card, behind the flights.
+        crate::ring::tick();
+        if crate::ring::mode() == crate::ring::Mode::Check {
+            crate::ring::check_landed(FINISHED.load(Ordering::Acquire));
+        }
+        let ring_checks = if late { ring_check(runs) } else { Vec::new() };
         let own = if late { self.card_steps(runs) } else { None };
         ahead.part(12);
         stage.next("submit: waiting for flights it reads from");
@@ -6223,7 +6548,8 @@ impl Host {
                 // Only until the flights that may write what is read have
                 // landed: their copy-back's end, not the card's other work.
                 relay_wait(why, |line| {
-                    blocked_by(&line.written, runs, false).is_none() && !card_steps::copied_read(&card_steps::copies(line), runs)
+                    blocked_by(&line.written, &line.exact, runs, false).is_none()
+                        && !card_steps::copied_read(&card_steps::copies(line), runs)
                 });
             } else {
                 self.settle(&mut submitted, why);
@@ -6296,6 +6622,7 @@ impl Host {
         // them so, the waking overlapping the asking below.
         let _hot = crate::shadow::hot();
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
+        crate::ring::check_note(this_submission, &ring_checks);
         // The ranges shaders write are counted for it (with the relay).
         crate::shadow::preparing(this_submission);
         let started = std::time::Instant::now();
@@ -6412,7 +6739,10 @@ impl Host {
         }
         let declared = declared_writes(runs);
         card_part(1, declaring);
-        let card = self.card_before(&declared, &picked, flown);
+        // The ring of constants held back from the sends where nothing of
+        // this submission reads it on the card ([`crate::ring`]).
+        let ring_hold = crate::ring::holds() && !ring_read_on_card(runs);
+        let card = self.card_before(&declared, &picked, flown, ring_hold);
         if let Some(probe) = probe {
             let finished = FINISHED.load(Ordering::Acquire);
             two_queues::place(probe, this_submission, card.is_some(), own.is_some(), runs.len(), finished);
@@ -8360,6 +8690,12 @@ impl HostList {
         let (mut us, mut bytes) = (std::time::Duration::ZERO, 0u64);
         #[cfg(feature = "diagnostics")]
         let (mut copies, mut refreshes, mut refreshed) = (0u64, 0u64, 0u64);
+        // The ring of constants ([`crate::ring`]): fills counted while it is
+        // learned, and those it serves free once in use.
+        let ring_learns = crate::ring::learning();
+        let ring_holds = crate::ring::holds();
+        let mut ring_fills: Vec<(usize, usize)> = Vec::new();
+        let mut ring_free = 0u64;
         for (i, step) in self.deferred().copies.iter().enumerate() {
             if matches!(step, Step::Copy(..) | Step::Fill(..)) && taken(i) {
                 continue;
@@ -8399,6 +8735,11 @@ impl HostList {
                     crate::port::filled(src, len);
                     if crate::freeze::fills_on() {
                         crate::freeze::fill(src, len);
+                    }
+                    if ring_learns {
+                        ring_fills.push((src, len));
+                    } else if ring_holds && crate::ring::contains(src, len) && touches(air, src, src + len) {
+                        ring_free += 1;
                     }
                     if wide_fills() {
                         batch.fills.push((dst, src, len));
@@ -8506,6 +8847,8 @@ impl HostList {
         PREPARING[0].fetch_add(us.as_micros() as u64, Ordering::Relaxed);
         PREPARING[1].fetch_add(bytes, Ordering::Relaxed);
         SPLIT[7].fetch_add(us.as_nanos() as u64, Ordering::Relaxed);
+        crate::ring::learn(&ring_fills);
+        crate::ring::count(crate::ring::S_FREE, ring_free);
         #[cfg(feature = "diagnostics")]
         {
             add(C::Copies, copies);

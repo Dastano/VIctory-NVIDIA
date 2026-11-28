@@ -676,23 +676,44 @@ impl SentRuns {
 /// that send knows the card did not hold these bytes yet
 /// ([`Shadow::card_merge_relay`]). Notes of sends that every fetch still to
 /// be merged came after are dropped.
-pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)> {
+///
+/// `ring_hold`: what lies in the title's ring of constants stays in the
+/// dirty lists, not sent, for a later submission that reads it on the card
+/// ([`crate::ring`]); the merges skip it as they skip any byte not sent.
+pub(crate) fn card_dirty(sent_as: u64, ring_hold: bool) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)> {
     let mut out: Vec<(Arc<Shadow>, Vec<(usize, usize)>)> = Vec::new();
     let mut touched = std::mem::take(&mut *TOUCHED.lock().unwrap_or_else(|e| e.into_inner()));
     touched.sort_unstable_by_key(|weak| weak.as_ptr() as usize);
     touched.dedup_by(|a, b| a.ptr_eq(b));
     let fetched = RELAY_FETCHED.load(Ordering::Acquire);
+    // Copies with bytes held back: on the list again.
+    let mut again = Vec::new();
     for weak in touched {
         let Some(shadow) = weak.upgrade() else {
             continue;
         };
+        let ring = crate::ring::offsets_in(shadow.start, shadow.len);
         let ranges = shadow
             .card
             .as_ref()
             .filter(|c| c.touched.swap(false, Ordering::AcqRel))
             .map(|c| {
                 let mut dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
-                let ranges = joined(std::mem::take(&mut *dirty));
+                let mut ranges = joined(std::mem::take(&mut *dirty));
+                if let Some(ring) = ring {
+                    let bytes = |r: &[(usize, usize)]| r.iter().map(|&(a, b)| (b - a) as u64).sum::<u64>();
+                    let (send, held) = crate::ring::split_held(ranges, ring);
+                    if ring_hold && !held.is_empty() {
+                        crate::ring::count(crate::ring::S_HELD, bytes(&held));
+                        *dirty = held;
+                        c.touched.store(true, Ordering::Release);
+                        again.push(weak.clone());
+                        ranges = send;
+                    } else {
+                        crate::ring::count(crate::ring::S_SENT, bytes(&held));
+                        ranges = joined([send, held].concat());
+                    }
+                }
                 if relay() {
                     let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
                     sent.forget(fetched);
@@ -704,6 +725,9 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
         if !ranges.is_empty() {
             out.push((shadow, ranges));
         }
+    }
+    if !again.is_empty() {
+        TOUCHED.lock().unwrap_or_else(|e| e.into_inner()).extend(again);
     }
     out
 }
@@ -3681,6 +3705,12 @@ impl Shadow {
                 // writes it.
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                 let old = &before[at - from..at - from + n];
+                if crate::ring::watching(start + at, start + at + n)
+                    && let Some(first) = first_difference(host, old)
+                {
+                    let last = last_difference(host, old).unwrap_or(first);
+                    crate::ring::card_wrote(start + at + first, start + at + last + 1);
+                }
                 let read = |first: usize, title: &mut [u8]| crate::host::read_into((start + at + first) as *const u8, title);
                 let Some((first, n)) = back_piece(host, old, &mut title, &mut mask, &mut runs, read) else {
                     continue;
@@ -3766,6 +3796,7 @@ impl Shadow {
         };
         let last = last_difference(now, held).unwrap_or(first);
         let (at, n) = (at + first, last + 1 - first);
+        crate::ring::card_wrote(start + at, start + at + n);
         let (now, held) = (&now[first..=last], &mut held[first..=last]);
         title.clear();
         title.resize(n, 0);
@@ -4675,6 +4706,21 @@ impl Shadow {
         unsafe { std::slice::from_raw_parts(self.data.add(at).cast_const(), to - at) }.to_vec()
     }
 
+    /// The offsets in `[from, to)` of the ring of constants that sends hold
+    /// back ([`card_dirty`]) and that have not gone to the card's side,
+    /// cut to it; empty unless the ring is in use ([`crate::ring::holds`]).
+    fn ring_held(&self, from: usize, to: usize) -> Vec<(usize, usize)> {
+        let (Some(card), Some(ring)) = (&self.card, crate::ring::offsets_in(self.start, self.len)) else {
+            return Vec::new();
+        };
+        let (from, to) = (from.max(ring.0), to.min(ring.1));
+        if from >= to {
+            return Vec::new();
+        }
+        let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+        dirty.iter().filter(|&&(a, b)| a < to && from < b).map(|&(a, b)| (a.max(from), b.min(to))).collect()
+    }
+
     /// Diagnostics: the offsets whose bytes have not gone to the card's side
     /// yet.
     pub(crate) fn card_dirty_now(&self) -> Vec<(usize, usize)> {
@@ -4808,11 +4854,27 @@ impl Shadow {
         // SAFETY: inside the mapping (checked above); only the submitting
         // thread writes it.
         let old = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), gpu.len()) };
+        // Bytes of the ring of constants held back from the sends
+        // ([`card_dirty`]): the card's side holds older title bytes there,
+        // not a shader's; they count as unchanged.
+        let patched;
+        let gpu = match self.ring_held(at, at + gpu.len()) {
+            held if held.is_empty() => gpu,
+            held => {
+                let mut bytes = gpu.to_vec();
+                for (a, b) in held {
+                    bytes[a - at..b - at].copy_from_slice(&old[a - at..b - at]);
+                }
+                patched = bytes;
+                &patched[..]
+            }
+        };
         let Some(first) = first_difference(gpu, old) else {
             return 0;
         };
         let last = last_difference(gpu, old).unwrap_or(first);
         let (at, n) = (at + first, last + 1 - first);
+        crate::ring::card_wrote(start + at, start + at + n);
         let (gpu, old) = (&gpu[first..=last], &mut old[first..=last]);
         title.clear();
         title.resize(n, 0);
@@ -4897,6 +4959,12 @@ impl Shadow {
         let mut changed = false;
         for (a, b) in outside(at, at + n, skip) {
             let (a, b) = (a - at, b - at);
+            if crate::ring::watching(start + at + a, start + at + b)
+                && let Some(first) = first_difference(&gpu[a..b], &held[a..b])
+            {
+                let last = last_difference(&gpu[a..b], &held[a..b]).unwrap_or(first);
+                crate::ring::card_wrote(start + at + a + first, start + at + a + last + 1);
+            }
             // Title memory that is not mapped: the CPU's side keeps what
             // the card wrote, as before; `title` is scratch then.
             changed |= merge_piece(&gpu[a..b], &mut held[a..b], &mut title[a..b]);

@@ -898,8 +898,10 @@ impl Writers {
 }
 
 /// What the steps of `runs` do, and which step each is (its list by address,
-/// its place in it). `written`: what flights may write.
-fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(usize, usize)>) {
+/// its place in it). `written`: what flights may write; `exact`: what of it
+/// writers known exactly write (a fill from the title's ring of constants is
+/// asked for by these alone, `fill_blocked`).
+fn does_of(written: &[(usize, usize)], exact: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(usize, usize)>) {
     let mut does = Vec::new();
     // Which step each is. One list's lock at a time: a submission may
     // name a list twice.
@@ -916,7 +918,7 @@ fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(u
                 Step::Fill(_, src, len, to) => Does::Fill {
                     src: *src,
                     len: *len,
-                    asked: read_blocked(written, *src, *len),
+                    asked: fill_blocked(written, exact, *src, *len),
                     to: to.is_some(),
                 },
                 Step::Texture(staging) => {
@@ -967,9 +969,12 @@ pub(super) fn cut_for(runs: &[&HostList]) -> Option<usize> {
     if first + 1 == runs.len() {
         return None;
     }
-    let written = line().written.clone();
-    blocked_by(&written, runs, false)?;
-    let (does, steps) = does_of(&written, runs);
+    let (written, exact) = {
+        let line = line();
+        (line.written.clone(), line.exact.clone())
+    };
+    blocked_by(&written, &exact, runs, false)?;
+    let (does, steps) = does_of(&written, &exact, runs);
     let mut behind = None;
     if plan(&does, stage(), true, &mut behind) != Err(BEHIND_PLACED) {
         return None;
@@ -1153,6 +1158,11 @@ impl Taken {
         self.steps.contains(&(std::ptr::from_ref(list) as usize, i))
     }
 
+    /// The title memory its copies write (from, to).
+    pub(super) fn copied_ranges(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        self.copied.iter().map(|(_, from, to)| (*from, *to))
+    }
+
     fn copied(&self) -> impl Iterator<Item = Writer> {
         self.copied.iter().map(|(shadow, from, to)| Writer {
             shadow: Some(shadow.clone()),
@@ -1180,18 +1190,18 @@ impl Host {
         if stage() == 0 || !relay_exact() {
             return None;
         }
-        let (written, copies) = {
+        let (written, exact, copies) = {
             let line = line();
             if line.written.is_empty() {
                 return None;
             }
-            (line.written.clone(), copies(&line))
+            (line.written.clone(), line.exact.clone(), copies(&line))
         };
-        blocked_by(&written, runs, false)?;
+        blocked_by(&written, &exact, runs, false)?;
         let taken = if copied_read(&copies, runs) {
             Err("a copy done on the card is read through another host copy")
         } else {
-            self.take_steps(&written, runs)
+            self.take_steps(&written, &exact, runs)
         };
         match taken {
             Ok(taken) => taken,
@@ -1206,10 +1216,10 @@ impl Host {
         }
     }
 
-    fn take_steps(&self, written: &[(usize, usize)], runs: &[&HostList]) -> Result<Option<Taken>, &'static str> {
+    fn take_steps(&self, written: &[(usize, usize)], exact: &[(usize, usize)], runs: &[&HostList]) -> Result<Option<Taken>, &'static str> {
         let mut spent = crate::timeline::span("steps on the card: chosen");
         let timed = Parts::begin();
-        let (mut does, steps) = does_of(written, runs);
+        let (mut does, steps) = does_of(written, exact, runs);
         let fills = card_fills();
         let by_source = if placed_reads() {
             read_behind_placed(&mut does, written) > 0
@@ -1759,6 +1769,32 @@ mod tests {
             copy(4900, 9000, 100, false),
         ];
         assert_eq!(planned(&does), [(0, 0)]);
+    }
+
+    /// Fills from the title's ring of constants (`crate::ring`) under the
+    /// heap's declared writes are planned free: not asked for, nothing taken
+    /// onto the card; one that reads what an exact writer in the air writes
+    /// is asked for as before, and so is every fill with the ring not in use.
+    #[test]
+    fn a_fill_from_the_ring_is_planned_free() {
+        let blocked_in = super::super::fill_blocked_in;
+        // The heap declared written whole; a copy at its place of a flight
+        // writes 0x5000..0x5100 exactly. The ring is 0x4000..0xc000.
+        let written = [(0, 0x10000)];
+        let exact = [(0x5000, 0x5100)];
+        let in_ring = |src: usize, len: usize| 0x4000 <= src && src + len <= 0xc000;
+        let fills = [(0x4000, 0x1e0), (0x4200, 0x1e0), (0x6000, 0x100), (0x5080, 0x40)];
+        let does = |ring: bool| -> Vec<Does> {
+            fills
+                .iter()
+                .map(|&(src, len)| Does::Fill { src, len, asked: blocked_in(&written, &exact, src, len, ring && in_ring(src, len)), to: true })
+                .collect()
+        };
+        assert_eq!(plan(&does(true), 1, false, &mut None), Ok(vec![(3, 0)]));
+        assert_eq!(plan(&does(true)[..3], 1, false, &mut None), Ok(vec![]));
+        assert_eq!(plan(&does(false), 1, false, &mut None), Ok(vec![(0, 0), (1, 0), (2, 0), (3, 0)]));
+        // A fill outside the ring under the declared writes stays asked for.
+        assert!(blocked_in(&written, &exact, 0x2000, 0x40, in_ring(0x2000, 0x40)));
     }
 
     /// What depends on a taken step, or it on it, is taken too, on the level
