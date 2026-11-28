@@ -323,3 +323,13 @@ memory, memory switches off, VICTORY_ACTIVATE_RAYS on, lendable prelude pool and
 ports); shaders re-translated and pipelines re-warmed. r113 (boat drive): 33.9 fps, 35 of 98 lines under 29.5 -
 inside the spread. One shot (boat driven into mangroves, camera inside the foliage) shows red-tinted leaves:
 game effect or fault, to check.
+
+## Redesign stage 2: the constant ring CPU-only (r114-r116)
+
+`VICTORY_RING_CPU=1` (36f259a, off by default): the ring was learned and confirmed (28.3 MB inside the heap, no
+GPU writes, 0 demotions); 5,872 / 1,824 fills a frame were served without card-step planning. Boat drive: r114
+32.7 fps, 47 of 97 lines under 29.5; r115 34.5 fps, 26 of 98 - inside the spread (33.5-35.4). The skinning passes'
+whole-heap view still reads the ring, so 11 MB of it are still sent a frame. No gain measured; stays off.
+r116 never reached the world: the title's watchdog store (write to 0 at image+0x23cf683, the same site trustno1
+notes for frames of many seconds) during loading, with the ring still learning (inactive). First such crash in
+~20 boat runs; watch for it (new with the 64d4931 merge, or a rare load hitch).
