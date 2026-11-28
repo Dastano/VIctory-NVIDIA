@@ -2875,6 +2875,9 @@ mod tests {
             // The UAV is written where the program reads it: its twin with the switch.
             let got = out.iter().find(|o| o[..5].iter().any(|&w| w != 0)).map(|o| o[..5].to_vec());
             assert_eq!(got.as_deref(), Some(&want[..]), "switch {raw}: {out:x?}");
+        }
+    }
+
     // Exercise the fixup with independent q/den/num, not only a complete
     // division sequence: the important q=NaN corner cannot be assumed away.
     fn div_fixup_corner_fixture() -> super::lower::Lowered {
