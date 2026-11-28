@@ -421,3 +421,8 @@ forklift and a box truck until the engine dies (red engine light); ~100 shots wi
 or texture faults; 21.3 fps.
 r141/r142 (`VICTORY_JOIN_PARTS=16`, standing): 25.4 / 23.0 fps (r132/r133 at 8: 25.7 / 24.6), 14-17 of ~29
 submissions joined (13 at 8): no gain; left at 8.
+r143/r144 (power plan High performance instead of Balanced, standing): 24.0 / 25.1 fps: no gain (plan restored).
+r145/r146 (`VICTORY_WIDE_THREADS=12`, the refresh workers; default 6 here): 26.3 / 24.5 fps (mean 25.4 against
+25.2), p10 21.3 / 21.4 (against ~20.4): within the spread; left at 6.
+In the first scene the lines under 29.5 sit at the story's scene changes with streaming (up to 10,800 draws, 11-18
+fps for 5-15 s), not in its play.
