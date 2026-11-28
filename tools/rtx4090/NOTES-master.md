@@ -374,3 +374,22 @@ victory.pdb with dbghelp; no admin rights, so no ETW):
   `Batch::copy_spans`, a BTreeMap range search, `Batch::add`).
 - About 12 helper threads run at 40-50% each, a third of that parked.
 The card is ~55% busy; per frame 16-18 ms of it idle, 4-6 ms of that behind our submitting thread.
+
+## trustno1 to 63b902f merged (r126-r133, city standing, DLSS Quality, no cap)
+
+r126 (`pin.ps1`: the title's main thread and our busiest submitting thread each pinned to a core of their own,
+switched on and off every 40 s in one run): on 18.8 fps, off 19.6: pinning costs; dropped. (The busiest thread of
+ours changes between the lanes, and CPU 0 also takes the system's interrupts.)
+Merge of trustno1 main 8fc2254 (52 commits: tearing presents also without frame generation, put onto our
+`SwapSetup` with trustno1's fallback for a refused present; division fixup with zero operands, lane masks in halves
+mode, the underwater program translating again; descriptor slots of split submissions given back; -NoFrameGenReady)
+and 63b902f (Series S rows in F1; the memory stack `VICTORY_SLOT_EVICT` / `ALLOCATOR_TRIM` / `BUDGET_PACK` on by
+default in the launcher). Shaders re-translated (25,762) and pipelines re-warmed (88,837 in 155 s).
+| Runs | Build | fps (bench summary) | draws |
+|---|---|---|---|
+| r123-r125 | master 388d9cb | 26.5 / 24.8 / 26.8 (26.0) | 7,450 |
+| r128, r129, r131 | + trustno1 8fc2254 | 24.8 / 23.7 / 25.3 (24.6) | 7,750 |
+| r130 | the same, `VICTORY_TEARING=0` | 24.6 | 7,960 |
+| r132, r133 | + 63b902f, memory stack on | 25.7 / 24.6 (25.2) | 7,490 |
+Within the city scene's spread (the standing scene drifts with traffic and light); kept for the fixes. A black
+wall lamp without any shading showed in r127 (walking behind the houses): a picture fault to chase.
