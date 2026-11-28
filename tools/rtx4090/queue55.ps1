@@ -1,4 +1,4 @@
-param([string]$Label = 'r121-save70-look', [int]$Seconds = 420, [string]$Keys = '', [string[]]$Extra = @('-Dlss', 'quality', '-Fps', '1000'), [int]$ShotEvery = 10, [string]$LiveFile = '', [int]$KeysUntil = 200)
+param([string]$Label = 'r121-save70-look', [int]$Seconds = 420, [string]$Keys = '', [string[]]$Extra = @('-Dlss', 'quality', '-Fps', '1000'), [int]$ShotEvery = 10, [string]$LiveFile = '', [int]$KeysUntil = 200, [string]$Switches = '')
 $fox = 'C:\Users\hinze\foxhound'
 $data = "$env:LOCALAPPDATA\victory\data\7952987A"
 $bench = 'C:\Users\hinze\vbench\bench-save-70\7952987A\saves'
@@ -6,8 +6,10 @@ $mk = ''; if ($Keys) { $mk = (Get-Content $Keys) -join ',' }
 Move-Item "$fox\victory-settings.txt" "$fox\victory-settings.user.txt" -Force
 Rename-Item "$data\saves" 'saves.user'
 Copy-Item $bench "$data\saves" -Recurse
+$more = @{}; if ($LiveFile) { $more.VICTORY_KEYS_FILE = $LiveFile }
+foreach ($kv in ($Switches -split ';')) { if ($kv -match '^(\w+)=(.*)$') { $more[$matches[1]] = $matches[2] } }
 try {
-  & 'C:\Users\hinze\gx-workers\bench.ps1' -Label $Label -Repo $fox -Launcher 'scripts\play-foxhound.ps1' -Seconds $Seconds -NoTurns -KeysUntil $KeysUntil -ShotEvery $ShotEvery -More $(if ($LiveFile) { @{ VICTORY_KEYS_FILE = $LiveFile } } else { @{} }) -MoreKeys $mk -Extra $Extra
+  & 'C:\Users\hinze\gx-workers\bench.ps1' -Label $Label -Repo $fox -Launcher 'scripts\play-foxhound.ps1' -Seconds $Seconds -NoTurns -KeysUntil $KeysUntil -ShotEvery $ShotEvery -More $more -MoreKeys $mk -Extra $Extra
 } finally {
   Get-Process victory, victory_sm -ErrorAction SilentlyContinue | Stop-Process -Force
   Start-Sleep 3

@@ -393,3 +393,19 @@ default in the launcher). Shaders re-translated (25,762) and pipelines re-warmed
 | r132, r133 | + 63b902f, memory stack on | 25.7 / 24.6 (25.2) | 7,490 |
 Within the city scene's spread (the standing scene drifts with traffic and light); kept for the fixes. A black
 wall lamp without any shading showed in r127 (walking behind the houses): a picture fault to chase.
+
+## Driving in the city; switches that did not help (r134-r138)
+
+The city car route works when Y comes ~50 s after the first world frames (`route.sh` watches run.log and appends
+`citycar-route.txt` to the live key file; `citycar-run.sh <label> [switches]` runs it): the character gets into the
+SUV left of the spawn point and drives into parked cars and walls (deformation, smoke, debris: no picture faults).
+r134: 18.8 fps with up to 11,600 draws. While driving the title's threads wait ~26 ms a frame at presents for our
+submitting lane, which works ~32 ms a frame (refreshes ~9 ms in ~41 flushes of ~9,600, ~8,500 known to copy
+nothing; copies in the card's memory ~5; planning steps ~3.5; write watch ~3.7). The route is not reproducible
+enough for timing (r135/r136 got stuck against a wall: ~6,000 draws, 24.2 fps both): timing stays on the standing
+scene, the drive is for the picture.
+| Run | Switch | fps | against |
+|---|---|---|---|
+| r135 | `VICTORY_SUBMIT_FRAMES=2` (drive) | 24.2 | r136 default drive 24.2 |
+| r137, r138 | `VICTORY_PASSES_HOT=0` (standing) | 23.9 / 25.1 | r132/r133 25.7 / 24.6 |
+Both left as they are.
