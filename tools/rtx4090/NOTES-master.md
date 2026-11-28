@@ -344,3 +344,33 @@ Boat drive (the hardest route): 33.5-35.4 fps mean, 20-40 % of 5-s lines under 2
 copies) and 2 (ring CPU-only) were built, tested and measured without gain; the premises behind them do not
 hold for this title. Further gains need a different approach (e.g. the title's own frame pacing, or a much
 deeper change of how title memory reaches the card).
+
+## The city benchmark: the user's 70% save (r121-r126)
+
+From now on the main benchmark is the user's 70% story save: it starts on a city street with many draws
+(8,000-11,000 a frame, against 4,000-5,000 in the jail and 5,000 on the boat). `tools/rtx4090/queue55.ps1` swaps
+it in for a run and puts the user's own saves back afterwards (checked against the backup after every run).
+`bench.ps1` now captures the game window with PrintWindow (PW_RENDERFULLCONTENT): other windows in front of the
+game no longer end up in the shots.
+
+r120 (new story, legal screens accepted by keys, the first in-game scene, DLSS Quality, `-Fps 30`): 29.49 fps,
+23 of 157 lines under 29.5, longest frame 1.3 s.
+r121 (city, walking and turning, DLSS Quality, no cap): 27.5 fps mean, 56 of 72 lines under 29.5, preparing
+23.4 ms. r123-r125 (city, standing at the spawn point: the scripted Y came before the world was there): 26.3 /
+24.6 / 26.5 fps (mean 25.8), 68-75 of 86 lines under 29.5, stalls up to 3.4 s.
+r122 (city, live keys through `VICTORY_KEYS_FILE` while watching the shots): Y gets in the SUV left of the spawn
+point; RT/LT drive, crashes deform the car (wheel off, smoke, "Engine damaged") with no picture faults; 17-22 fps
+in the alley behind the houses (10,000 draws).
+
+Where the time goes in the city (sampling the threads from outside: `ripsample.ps1` suspends a thread, reads its
+instruction pointer and scans its stack for return addresses into victory.exe; `symbolize.ps1` names them from
+victory.pdb with dbghelp; no admin rights, so no ETW):
+- The title's main thread is not the limit: it spends ~70% of its samples in `NtWaitForSingleObject` /
+  `NtDelayExecution` from one polling loop (it waits at presents, as r90 found).
+- Our submitting lane thread (`queue::behind::Lane::serve` running `Host::submit`) is 84% busy: 25% of its samples
+  parked (`NtWaitForAlertByThreadId`: the lane waiting for work, `send::Own::wait`, the refresh workers' joins in
+  `shadow::wide`, descriptor `SYNC_ROUNDS`), 8.7% in `NtGetWriteWatch`, 12% in the NVIDIA driver, ~36% our code
+  (top: `shadow::wide`, `victory_safe_copy_at`, `watch::nothing_new`/`Shadow::nothing_new`, `Host::submit`,
+  `Batch::copy_spans`, a BTreeMap range search, `Batch::add`).
+- About 12 helper threads run at 40-50% each, a third of that parked.
+The card is ~55% busy; per frame 16-18 ms of it idle, 4-6 ms of that behind our submitting thread.

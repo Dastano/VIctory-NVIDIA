@@ -4,7 +4,7 @@
 param(
     [Parameter(Mandatory)][string]$Label,
     [int]$Seconds = 420,
-    [string]$Repo = (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent),
+    [string]$Repo = 'C:\Users\hinze\VIctory-NVIDIA',
     [switch]$SeriesX,
     [hashtable]$More = @{},
     [string[]]$Extra = @(),
@@ -17,7 +17,7 @@ param(
     [string]$MoreKeys = ''
 )
 $ErrorActionPreference = 'Continue'
-$out = "$env:USERPROFILE\vbench\$Label"
+$out = "C:\Users\hinze\vbench\$Label"
 New-Item -ItemType Directory -Force $out | Out-Null
 Get-Process victory, victory_sm -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep 2
@@ -25,8 +25,8 @@ Start-Sleep 2
 # Enter alle 4 s von 15 bis 200 s (Startbildschirme, Kontoauswahl, Story starten)
 $keys = (15..([int]($KeysUntil / 4)) | ForEach-Object { "$($_ * 4):Enter" }) -join ','
 # Kamera drehen in der Spielszene (rechter Stick = J/L): ab 280 s alle 20 s je 4 s
-$turns = (0..$Turns | ForEach-Object { $s = 280 + 20 * $_; $k = if ($_ % 2) { 'J' } else { 'L' }; "$s-$($s + 4):$k" }) -join ','
-if (-not $NoTurns) { $keys = "$keys,$turns" }
+$turnKeys = (0..$Turns | ForEach-Object { $s = 280 + 20 * $_; $k = if ($_ % 2) { 'J' } else { 'L' }; "$s-$($s + 4):$k" }) -join ','
+if (-not $NoTurns) { $keys = "$keys,$turnKeys" }
 if ($MoreKeys) { $keys = "$keys,$MoreKeys" }
 $m = @{ VICTORY_KEYS = $keys; VICTORY_LOG = 'info' }
 foreach ($k in $More.Keys) { $m[$k] = $More[$k] }
@@ -34,7 +34,7 @@ $moreText = ($m.GetEnumerator() | ForEach-Object { "'$($_.Key)'='$($_.Value)'" }
 $series = if ($SeriesX) { '-SeriesX' } else { '' }
  $extraText = $Extra -join ' '
 $nosm = if ($Launcher -like '*foxhound*') { '' } else { '-NoSmoothMotion' }
-$cmd = "& '$Repo\$Launcher' -Exe '$env:VICTORY_EXE' $nosm $series $extraText -More @{$moreText}"
+$cmd = "& '$Repo\$Launcher' -Exe 'F:\gta\gta6\game_scarlett_master.exe' $nosm $series $extraText -More @{$moreText}"
 Set-Content "$out\cmd.txt" $cmd
 Set-Content "$out\launch.ps1" $cmd -Encoding UTF8
 $p = Start-Process cmd -ArgumentList '/c', "powershell -NoProfile -ExecutionPolicy Bypass -File `"$out\launch.ps1`" > `"$out\run.log`" 2>&1" -PassThru -WindowStyle Minimized
@@ -44,8 +44,11 @@ Add-Type @"
 using System; using System.Runtime.InteropServices;
 public class WinRect { [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
-  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h); }
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+  [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr hdc, uint flags); }
 "@
+[void][WinRect]::SetProcessDPIAware()
 $t0 = Get-Date
 if ($Affinity) { for ($k = 0; $k -lt 60; $k++) { $vp = Get-Process victory, victory_sm -ErrorAction SilentlyContinue | Select-Object -First 1; if ($vp) { $vp.ProcessorAffinity = [IntPtr][int64]$Affinity; Add-Content "$out\notes.txt" ("affinity 0x{0:X} set at {1} s" -f $Affinity, $k); break }; Start-Sleep 1 } }
 $shots = 0
@@ -62,7 +65,11 @@ while (((Get-Date) - $t0).TotalSeconds -lt $Seconds) {
         if ($b.Width -lt 100) { continue }
         $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
         $g = [System.Drawing.Graphics]::FromImage($bmp)
-        [void][WinRect]::SetForegroundWindow($gp.MainWindowHandle); Start-Sleep -Milliseconds 300; $g.CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
+        # PrintWindow (PW_RENDERFULLCONTENT): nur der Fensterinhalt, auch wenn andere Fenster davor liegen
+        $hdc = $g.GetHdc(); $okPw = [WinRect]::PrintWindow($gp.MainWindowHandle, $hdc, 2); $g.ReleaseHdc($hdc)
+        $dark = $true; foreach ($fx in 0.3, 0.5, 0.7) { $px = $bmp.GetPixel([int]($b.Width * $fx), [int]($b.Height * 0.5)); if ($px.R + $px.G + $px.B -gt 15) { $dark = $false } }
+        if (-not $okPw -or $dark) { Add-Content "$out
+otes.txt" "printwindow failed/dark, skipped shot"; $g.Dispose(); $bmp.Dispose(); continue }
         $bmp.Save(("$out\shot-{0:000}.jpg" -f [int]((Get-Date) - $t0).TotalSeconds), [System.Drawing.Imaging.ImageFormat]::Jpeg)
         $g.Dispose(); $bmp.Dispose(); $shots++
     } catch {}
@@ -88,4 +95,4 @@ if ($world.Count -gt 24) {
     $sum += (" || last2min fps mean={0:N1} min={1:N1} prep={2:N1} back={3:N1} dropped={4:N0}" -f ($tail.fps | Measure-Object -Average).Average, $tf[0], ($tail.prep | Measure-Object -Average).Average, ($tail.back | Measure-Object -Average).Average, ($tail.dropped | Measure-Object -Average).Average)
 }
 $sum | Tee-Object -FilePath "$out\summary.txt"
-Add-Content "$env:USERPROFILE\vbench\results.txt" "$(Get-Date -Format s) $sum | shots=$shots"
+Add-Content C:\Users\hinze\vbench\results.txt "$(Get-Date -Format s) $sum | shots=$shots"
