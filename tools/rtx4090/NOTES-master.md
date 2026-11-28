@@ -419,3 +419,5 @@ city runs fall on the first world frame (the load), not in play (in play the lon
 r140 (city drive, shots every 6 s, `montage.ps1` puts 16 on a sheet): into the SUV, crashes into walls, cars, a
 forklift and a box truck until the engine dies (red engine light); ~100 shots without black boxes, missing faces
 or texture faults; 21.3 fps.
+r141/r142 (`VICTORY_JOIN_PARTS=16`, standing): 25.4 / 23.0 fps (r132/r133 at 8: 25.7 / 24.6), 14-17 of ~29
+submissions joined (13 at 8): no gain; left at 8.
