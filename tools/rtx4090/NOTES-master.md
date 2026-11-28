@@ -333,3 +333,14 @@ whole-heap view still reads the ring, so 11 MB of it are still sent a frame. No 
 r116 never reached the world: the title's watchdog store (write to 0 at image+0x23cf683, the same site trustno1
 notes for frames of many seconds) during loading, with the ring still learning (inactive). First such crash in
 ~20 boat runs; watch for it (new with the 64d4931 merge, or a rare load hitch).
+
+r117 (current master, all redesign switches off, boat drive): 34.0 fps, 34 of 98 lines under 29.5, no crash: the
+r116 watchdog crash did not repeat (a rare load hitch, not a regression so far).
+
+## Where this stands (2026-11-28)
+
+Stable 30 fps through the first mission is not reached. Cell window: 30.0 held. Walking uncapped: 38-47 fps.
+Boat drive (the hardest route): 33.5-35.4 fps mean, 20-40 % of 5-s lines under 29.5. Redesign stages 1 (frozen
+copies) and 2 (ring CPU-only) were built, tested and measured without gain; the premises behind them do not
+hold for this title. Further gains need a different approach (e.g. the title's own frame pacing, or a much
+deeper change of how title memory reaches the card).
