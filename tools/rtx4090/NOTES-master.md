@@ -409,3 +409,13 @@ scene, the drive is for the picture.
 | r135 | `VICTORY_SUBMIT_FRAMES=2` (drive) | 24.2 | r136 default drive 24.2 |
 | r137, r138 | `VICTORY_PASSES_HOT=0` (standing) | 23.9 / 25.1 | r132/r133 25.7 / 24.6 |
 Both left as they are.
+
+## Checks of the merged master (r139-r140)
+
+Tests: victory-shader 299 passed (5 ignored), victory-gpu 495 passed (37 ignored), after the merge's test conflict
+was closed. r139 (new story, the first in-game scene, `-Fps 30`): 28.8 fps, ended in a cutscene (3,750 draws a
+frame; r120 ended in play with 4,750), so not the same frames; picture clean. The 3.4 s and 1.5 s frames of the
+city runs fall on the first world frame (the load), not in play (in play the longest were 0.27-0.65 s).
+r140 (city drive, shots every 6 s, `montage.ps1` puts 16 on a sheet): into the SUV, crashes into walls, cars, a
+forklift and a box truck until the engine dies (red engine light); ~100 shots without black boxes, missing faces
+or texture faults; 21.3 fps.
