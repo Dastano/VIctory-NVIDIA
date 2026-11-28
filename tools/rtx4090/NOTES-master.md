@@ -317,3 +317,9 @@ frozen copies looked at per frame, 470-846 of ~7,000 refreshes not recorded: few
 frames, so the premise (most no-op refreshes belong to idle copies) does not hold; the no-op refreshes are of
 copies the title keeps touching a little. Stage 1 stays off. Stage 2 (the constant ring as CPU-only) targets
 card-step planning and card sends instead and stays a candidate.
+
+Merged trustno1-coder/VIctory-NVIDIA up to 64d4931 (PS4/DualShock 4 pads, F1 menu saves at once, long-session
+memory, memory switches off, VICTORY_ACTIVATE_RAYS on, lendable prelude pool and adapter pick superseding our
+ports); shaders re-translated and pipelines re-warmed. r113 (boat drive): 33.9 fps, 35 of 98 lines under 29.5 -
+inside the spread. One shot (boat driven into mangroves, camera inside the foliage) shows red-tinted leaves:
+game effect or fault, to check.
